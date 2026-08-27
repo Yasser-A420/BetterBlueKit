@@ -19,10 +19,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        // Commented out for local-package use: the SwiftLint build tool
-        // plugin conflicts with the main BetterBlue project build.
-        // Uncomment when pushing upstream to the standalone repo.
-        // .package(url: "https://github.com/SimplyDanny/SwiftLintPlugins", from: "0.61.0")
+        .package(url: "https://github.com/SimplyDanny/SwiftLintPlugins", from: "0.61.0")
     ],
     targets: [
         .target(
@@ -41,7 +38,7 @@ let package = Package(
                 .define("DEBUG", .when(configuration: .debug)),
                 .define("RELEASE", .when(configuration: .release))
             ],
-            // plugins: [.plugin(name: "SwiftLintBuildToolPlugin", package: "SwiftLintPlugins")],
+            plugins: [.plugin(name: "SwiftLintBuildToolPlugin", package: "SwiftLintPlugins")],
         ),
         .executableTarget(
             name: "bbcli",
