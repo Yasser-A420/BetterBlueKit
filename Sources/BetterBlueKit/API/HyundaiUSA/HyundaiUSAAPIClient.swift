@@ -139,7 +139,7 @@ public final class HyundaiUSAAPIClient: APIClientBase, APIClientProtocol {
     }
 
     public func optionalFeaturesSupported() -> [OptionalAPIFeature] {
-        [.evTripSummary]
+        [.evTripSummary, .surroundView]
     }
 
     public func fetchEVTripSummary(for vehicle: Vehicle, authToken: AuthToken) async throws -> [EVTripSummary]? {
