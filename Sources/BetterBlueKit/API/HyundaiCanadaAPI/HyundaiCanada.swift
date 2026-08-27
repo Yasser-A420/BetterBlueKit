@@ -153,7 +153,7 @@ extension HyundaiCanadaAPIClient {
         return false
     }
 
-    private var timezoneOffsetHeader: String {
+    var timezoneOffsetHeader: String {
         let hours = TimeZone.current.secondsFromGMT() / 3600
         return String(format: "%+03d", hours)
     }

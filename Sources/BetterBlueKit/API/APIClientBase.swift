@@ -233,16 +233,23 @@ open class APIClientBase {
         let responseHeaders: [String: String]
         let responseBody: String?
 
+        // Oversized values go first, and regardless of the redaction
+        // setting: a surround-view response is megabytes of base64 JPEG,
+        // which would bloat the persisted log (and every debug export)
+        // and drag the redaction regexes across the whole payload.
+        let sizedRequestBody = SensitiveDataRedactor.elideOversizedValues(logData.requestBody)
+        let sizedResponseBody = SensitiveDataRedactor.elideOversizedValues(logData.responseBody)
+
         if configuration.redactPII {
             requestHeaders = redactSensitiveHeaders(logData.requestHeaders)
-            requestBody = redactSensitiveData(in: logData.requestBody)
+            requestBody = redactSensitiveData(in: sizedRequestBody)
             responseHeaders = redactSensitiveHeaders(logData.responseHeaders)
-            responseBody = redactSensitiveData(in: logData.responseBody)
+            responseBody = redactSensitiveData(in: sizedResponseBody)
         } else {
             requestHeaders = logData.requestHeaders
-            requestBody = logData.requestBody
+            requestBody = sizedRequestBody
             responseHeaders = logData.responseHeaders
-            responseBody = logData.responseBody
+            responseBody = sizedResponseBody
         }
 
         let httpLog = HTTPLog(

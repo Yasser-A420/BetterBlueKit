@@ -153,7 +153,7 @@ func printUsage() {
 
       Parses a raw API response JSON and outputs the parsed BetterBlueKit struct.
 
-      -t, --type <type>         Parse type: 'vehicles' or 'vehicleStatus'
+      -t, --type <type>         Parse type: 'vehicles', 'vehicleStatus', or 'surroundView'
       --vin <vin>               VIN for vehicleStatus parsing (default: TESTVIN0000000000)
       --electric                Mark vehicle as electric for parsing (auto-detected from
                                 evStatus field in vehicles response if not specified)
@@ -168,6 +168,7 @@ func printUsage() {
       bbcli parse -b hyundai -r US -t vehicleStatus response.json
       bbcli parse -b hyundai -r US -t vehicleStatus '{"vehicleStatus": {...}}'
       bbcli parse -b kia -r US -t vehicles --electric response.json
+      bbcli parse -b hyundai -r CA -t surroundView lastmcrsvm.json
     """)
 }
 
@@ -497,6 +498,76 @@ func fetchEVTripInfo(state: CLIState) async throws {
     }
 }
 
+// MARK: - Surround View
+
+@MainActor
+func requestSurroundView(state: CLIState) async throws {
+    guard let vehicle = selectVehicle(state: state) else { return }
+    guard let token = state.authToken else {
+        throw APIError(message: "Not logged in")
+    }
+    guard let client = state.client else {
+        throw APIError(message: "No API client initialized")
+    }
+
+    printSubheader("Requesting Surround View Capture for \(vehicle.model)")
+
+    try await client.requestSurroundViewCapture(for: vehicle, authToken: token)
+
+    printSuccess("Capture requested")
+    print("The vehicle now wakes its cameras, shoots, and uploads.")
+    print("Wait 1-2 minutes, then run command 13 to fetch the images.")
+}
+
+@MainActor
+func fetchSurroundView(state: CLIState) async throws {
+    guard let vehicle = selectVehicle(state: state) else { return }
+    guard let token = state.authToken else {
+        throw APIError(message: "Not logged in")
+    }
+    guard let client = state.client else {
+        throw APIError(message: "No API client initialized")
+    }
+
+    printSubheader("Fetching Surround View for \(vehicle.model)")
+
+    let captures = try await client.fetchSurroundViewCaptures(for: vehicle, authToken: token)
+    printSuccess("Found \(captures.count) capture(s)")
+
+    let outputDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("surround-view")
+
+    for (index, capture) in captures.enumerated() {
+        print("\n[\(index + 1)] Captured: \(capture.capturedAt.map(String.init(describing:)) ?? "unknown")")
+        print("    Frames: \(capture.frames.count) (\(capture.byteCount / 1024) KB)")
+        if let heading = capture.heading {
+            print("    Heading: \(heading)°")
+        }
+        if capture.location != nil {
+            print("    Location: [redacted — see HTTP log with --no-redaction]")
+        }
+        for tile in capture.tiles {
+            if let crop = tile.crop {
+                print("    Tile \(tile.position.displayName): "
+                    + "\(crop.width)x\(crop.height) at x=\(crop.x) in frame \(tile.frameIndex)")
+            } else {
+                print("    Tile \(tile.position.displayName): whole frame \(tile.frameIndex)")
+            }
+        }
+
+        for (frameIndex, frame) in capture.frames.enumerated() {
+            let stamp = capture.capturedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
+            let file = outputDirectory.appendingPathComponent("\(stamp)-frame\(frameIndex).jpg")
+            try FileManager.default.createDirectory(
+                at: outputDirectory,
+                withIntermediateDirectories: true
+            )
+            try frame.write(to: file)
+            print("    Wrote \(file.path)")
+        }
+    }
+}
+
 // MARK: - Interactive Menu
 
 func showMenu() {
@@ -516,6 +587,8 @@ func showMenu() {
       9. Set Charge Limits
      10. Fetch EV Trip Summary
      11. Fetch EV Trip Info
+     12. Request Surround View Capture
+     13. Fetch Surround View Images
       0. Exit
 
     """)
@@ -564,6 +637,10 @@ func runInteractiveLoop(state: CLIState) async {
                 try await fetchEVTripSummary(state: state)
             case "11":
                 try await fetchEVTripInfo(state: state)
+            case "12":
+                try await requestSurroundView(state: state)
+            case "13":
+                try await fetchSurroundView(state: state)
             case "0", "q", "quit", "exit":
                 print("\nGoodbye!")
                 return
@@ -589,6 +666,7 @@ func runInteractiveLoop(state: CLIState) async {
 enum ParseType: String {
     case vehicles
     case vehicleStatus
+    case surroundView
 }
 
 struct ParseOptions {
@@ -637,8 +715,10 @@ func parseParseArguments() -> ParseOptions {
                     options.parseType = .vehicles
                 case "vehiclestatus", "status":
                     options.parseType = .vehicleStatus
+                case "surroundview", "svm":
+                    options.parseType = .surroundView
                 default:
-                    printError("Unknown parse type: \(typeArg). Use 'vehicles' or 'vehicleStatus'.")
+                    printError("Unknown parse type: \(typeArg). Use 'vehicles', 'vehicleStatus', or 'surroundView'.")
                     exit(1)
                 }
                 argIndex += 1
@@ -764,6 +844,20 @@ func runParseMode() async -> Int32 {
             let status = try parseVehicleStatus(client: client, data: data, vehicle: vehicle)
             printSuccess("Parsed vehicle status")
             print(encodePrettyJSON(status))
+
+        case .surroundView:
+            let vehicle = Vehicle(
+                vin: options.vin,
+                regId: "parse-mode",
+                model: "parse-mode",
+                accountId: UUID(),
+                fuelType: options.fuelType ?? .gas,
+                generation: 2,
+                odometer: Distance(length: 0, units: .miles)
+            )
+            let captures = try parseSurroundView(client: client, data: data, vehicle: vehicle)
+            printSuccess("Parsed \(captures.count) surround view capture(s)")
+            try describeSurroundViewCaptures(captures)
         }
 
         return 0
@@ -788,6 +882,55 @@ func parseVehicles(client: any APIClientProtocol, data: Data, options: ParseOpti
         return try kiaUSA.parseVehiclesResponse(data)
     } else {
         throw APIError(message: "Unsupported client type for vehicle parsing")
+    }
+}
+
+@MainActor
+func parseSurroundView(
+    client: any APIClientProtocol,
+    data: Data,
+    vehicle: Vehicle
+) throws -> [SurroundViewCapture] {
+    guard let hyundaiCanada = client as? HyundaiCanadaAPIClient else {
+        throw APIError(message: "Unsupported client type for surround view parsing")
+    }
+    return try hyundaiCanada.parseCanadaSurroundViewResponse(data, for: vehicle)
+}
+
+/// Prints what each capture holds and writes its frames to disk, so a
+/// saved payload can be checked without a vehicle in the loop.
+/// Coordinates are deliberately not printed — the images and their GPS
+/// fix say exactly where the car (and usually its owner) was.
+func describeSurroundViewCaptures(_ captures: [SurroundViewCapture]) throws {
+    let outputDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("surround-view")
+
+    for (index, capture) in captures.enumerated() {
+        print("\n[\(index + 1)] Captured: \(capture.capturedAt.map(String.init(describing:)) ?? "unknown")")
+        print("    Frames: \(capture.frames.count) (\(capture.byteCount / 1024) KB)")
+        print("    Has location: \(capture.location != nil)")
+        if let heading = capture.heading {
+            print("    Heading: \(heading)°")
+        }
+        if let doors = capture.doorOpen {
+            print("    Doors open: \(doors.anyOpen ? doors.openDoorsDescription : "none")")
+        }
+        for tile in capture.tiles {
+            if let crop = tile.crop {
+                print("    Tile \(tile.position.displayName): "
+                    + "\(crop.width)x\(crop.height) at x=\(crop.x) in frame \(tile.frameIndex)")
+            } else {
+                print("    Tile \(tile.position.displayName): whole frame \(tile.frameIndex)")
+            }
+        }
+
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        for (frameIndex, frame) in capture.frames.enumerated() {
+            let stamp = capture.capturedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
+            let file = outputDirectory.appendingPathComponent("\(stamp)-frame\(frameIndex).jpg")
+            try frame.write(to: file)
+            print("    Wrote \(file.path)")
+        }
     }
 }
 

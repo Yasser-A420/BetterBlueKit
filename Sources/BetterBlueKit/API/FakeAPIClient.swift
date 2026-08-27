@@ -110,6 +110,27 @@ public class FakeAPIClient: APIClientProtocol {
         try await vehicleProvider.executeCommand(command, for: vehicle.vin, accountId: accountId)
         BBLogger.info(.fakeAPI, "Command completed successfully for fake vehicle '\(vehicle.vin)'")
     }
+
+    // Fake vehicles always claim surround view so the feature can be
+    // exercised in the simulator; the provider decides what imagery (if
+    // any) comes back.
+    public func optionalFeaturesSupported() -> [OptionalAPIFeature] {
+        [.surroundView]
+    }
+
+    public func requestSurroundViewCapture(for vehicle: Vehicle, authToken _: AuthToken) async throws {
+        try await vehicleProvider.requestSurroundViewCapture(for: vehicle.vin, accountId: accountId)
+        BBLogger.info(.fakeAPI, "Requested surround view capture for fake vehicle '\(vehicle.vin)'")
+    }
+
+    public func fetchSurroundViewCaptures(
+        for vehicle: Vehicle,
+        authToken _: AuthToken
+    ) async throws -> [SurroundViewCapture] {
+        let captures = try await vehicleProvider.getSurroundViewCaptures(for: vehicle.vin, accountId: accountId)
+        BBLogger.info(.fakeAPI, "Fetched \(captures.count) surround view capture(s) for '\(vehicle.vin)'")
+        return captures
+    }
 }
 
 // MARK: - Vehicle Provider Protocol
@@ -129,4 +150,17 @@ public protocol FakeVehicleProvider {
     func shouldFailCommand(_ command: VehicleCommand, for vin: String, accountId: UUID) async throws -> Bool
     func getCustomCredentialErrorMessage(accountId: UUID) async throws -> String
     func getCustomPinErrorMessage(for vin: String, accountId: UUID) async throws -> String
+
+    // Surround view — defaulted below so existing providers keep
+    // conforming without changes.
+    func requestSurroundViewCapture(for vin: String, accountId: UUID) async throws
+    func getSurroundViewCaptures(for vin: String, accountId: UUID) async throws -> [SurroundViewCapture]
+}
+
+public extension FakeVehicleProvider {
+    func requestSurroundViewCapture(for vin: String, accountId: UUID) async throws {}
+
+    func getSurroundViewCaptures(for vin: String, accountId: UUID) async throws -> [SurroundViewCapture] {
+        []
+    }
 }

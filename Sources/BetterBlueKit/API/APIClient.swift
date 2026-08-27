@@ -15,15 +15,16 @@ import Foundation
 /// that connects for them (surfaced in the app as "Connection").
 public enum HyundaiCanadaVariant: String, Codable, CaseIterable, Sendable {
     /// Web-portal login (`from: CWP` + a browser User-Agent) — clears
-    /// Cloudflare for most users — paired with native-app headers on the
-    /// `evc/fme` location endpoint (the combination a CA owner verified
-    /// in BetterBlueKit#36).
+    /// Cloudflare for most users.
     case webPortal
     /// Native-app identity everywhere (`from: SPA` + the MyHyundai iOS
-    /// User-Agent) with the legacy `fndmcr` location endpoint — for users
-    /// where Cloudflare blocks the web-portal identity but the app one
-    /// works.
+    /// User-Agent) — for users where Cloudflare blocks the web-portal
+    /// identity but the app one works.
     case nativeApp
+
+    // Note: the variant no longer selects the location endpoint. Both
+    // use `fndmcr`; the `evc/fme` endpoint the web-portal variant once
+    // called (BetterBlueKit#36) now times out for every request.
 
     public static var `default`: HyundaiCanadaVariant { .webPortal }
 
@@ -138,6 +139,16 @@ public protocol APIClientProtocol {
     /// Optional: Fetch specific EV trip info summary for a given date (not all brands/APIs support this)
     func fetchEVTripInfo(for vehicle: Vehicle, authToken: AuthToken, date: Date) async throws -> [EVTripInfo]?
 
+    /// Optional: Ask the vehicle to take a fresh surround-view capture.
+    /// Returns as soon as the request is accepted — the vehicle then
+    /// wakes its cameras, shoots, and uploads, which takes minutes.
+    /// Poll `fetchSurroundViewCaptures` for the result.
+    func requestSurroundViewCapture(for vehicle: Vehicle, authToken: AuthToken) async throws
+
+    /// Optional: Fetch the surround-view captures the server currently
+    /// holds for a vehicle, newest first. Never triggers a new capture.
+    func fetchSurroundViewCaptures(for vehicle: Vehicle, authToken: AuthToken) async throws -> [SurroundViewCapture]
+
     /// The optional capabilities this client implements, beyond the required
     /// protocol surface. Clients override this single method; callers use the
     /// convenience helpers (`supportsMFA()`, `supportedEVTripTypes()`) instead
@@ -186,6 +197,9 @@ public enum OptionalAPIFeature: String, Codable, Sendable, CaseIterable {
     case evTripSummary
     /// Per-trip drill-down for a specific date (`fetchEVTripInfo`).
     case evTripInfo
+    /// 360° camera stills on demand (`requestSurroundViewCapture` /
+    /// `fetchSurroundViewCaptures`).
+    case surroundView
 }
 
 // MARK: - Default Implementations
@@ -199,6 +213,17 @@ extension APIClientProtocol {
         nil
     }
 
+    public func requestSurroundViewCapture(for vehicle: Vehicle, authToken: AuthToken) async throws {
+        throw APIError(message: "Surround view not supported for this API", apiName: "APIClient")
+    }
+
+    public func fetchSurroundViewCaptures(
+        for vehicle: Vehicle,
+        authToken: AuthToken
+    ) async throws -> [SurroundViewCapture] {
+        []
+    }
+
     public func optionalFeaturesSupported() -> [OptionalAPIFeature] {
         []
     }
@@ -206,6 +231,12 @@ extension APIClientProtocol {
     /// Returns true if this API client supports MFA (Multi-Factor Authentication)
     public func supportsMFA() -> Bool {
         optionalFeaturesSupported().contains(.mfa)
+    }
+
+    /// Returns true if this API client can take and retrieve
+    /// surround-view camera captures
+    public func supportsSurroundView() -> Bool {
+        optionalFeaturesSupported().contains(.surroundView)
     }
 
     /// Returns the types of EV trip details this API client supports

@@ -150,18 +150,25 @@ extension HyundaiCanadaAPIClient {
             throw APIError.logError("Invalid Canada location response", apiName: apiName)
         }
 
-        // `evc/fme` returns coordinates under `result.gpsDetail.coord`;
-        // the legacy `fndmcr` endpoint put them at `result.coord`. Prefer
-        // the new shape, fall back to the old one. (BetterBlueKit#36.)
+        // Three shapes seen from this API: `result.gpsDetail.coord`,
+        // `result.coord` (BetterBlueKit#36), and the flat
+        // `gpsDetail.coordLat` / `coordLon` pair the surround-view
+        // endpoints return. Accept all of them rather than betting on
+        // which one a given endpoint uses today.
         let gpsDetail = result["gpsDetail"] as? [String: Any]
-        guard let coord = (gpsDetail?["coord"] as? [String: Any])
-            ?? (result["coord"] as? [String: Any]) else {
-            throw APIError.logError("Invalid Canada location response", apiName: apiName)
+
+        if let coord = (gpsDetail?["coord"] as? [String: Any]) ?? (result["coord"] as? [String: Any]) {
+            return VehicleStatus.Location(
+                latitude: extractNumber(from: coord["lat"]) ?? 0,
+                longitude: extractNumber(from: coord["lon"]) ?? 0
+            )
         }
 
-        return VehicleStatus.Location(
-            latitude: extractNumber(from: coord["lat"]) ?? 0,
-            longitude: extractNumber(from: coord["lon"]) ?? 0
-        )
+        if let latitude: Double = extractNumber(from: gpsDetail?["coordLat"]),
+           let longitude: Double = extractNumber(from: gpsDetail?["coordLon"]) {
+            return VehicleStatus.Location(latitude: latitude, longitude: longitude)
+        }
+
+        throw APIError.logError("Invalid Canada location response", apiName: apiName)
     }
 }

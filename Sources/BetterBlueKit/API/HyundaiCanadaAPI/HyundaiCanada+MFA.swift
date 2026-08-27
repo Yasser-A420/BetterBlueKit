@@ -28,10 +28,6 @@ import Foundation
 
 extension HyundaiCanadaAPIClient {
 
-    public func optionalFeaturesSupported() -> [OptionalAPIFeature] {
-        [.mfa]
-    }
-
     // MARK: - Login-time challenge detection
 
     /// Detects the `errorCode == "7110"` (OTP Required) response shape

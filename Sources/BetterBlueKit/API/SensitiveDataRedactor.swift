@@ -117,6 +117,66 @@ public enum SensitiveDataRedactor {
         return redacted
     }
 
+    /// Replaces JSON string values longer than `threshold` with a note
+    /// of their length, leaving the surrounding structure intact.
+    ///
+    /// Surround-view responses carry megabytes of base64 JPEG in a single
+    /// field. HTTP logs are persisted to SwiftData, synced, and bundled
+    /// into debug exports, so storing that verbatim would bloat all three
+    /// — and the imagery tells a reader nothing the metadata doesn't.
+    public static func elideOversizedValues(_ text: String?, threshold: Int = 4096) -> String? {
+        guard let text else { return nil }
+        guard text.utf8.count > threshold else { return text }
+
+        let quote = UInt8(ascii: "\"")
+        let backslash = UInt8(ascii: "\\")
+        let bytes = Array(text.utf8)
+
+        var output: [UInt8] = []
+        output.reserveCapacity(bytes.count / 2)
+
+        var index = 0
+        while index < bytes.count {
+            guard bytes[index] == quote else {
+                output.append(bytes[index])
+                index += 1
+                continue
+            }
+
+            // Walk to the closing quote, honoring backslash escapes.
+            var cursor = index + 1
+            var escaped = false
+            while cursor < bytes.count {
+                let byte = bytes[cursor]
+                if escaped {
+                    escaped = false
+                } else if byte == backslash {
+                    escaped = true
+                } else if byte == quote {
+                    break
+                }
+                cursor += 1
+            }
+
+            guard cursor < bytes.count else {
+                // Unterminated string — copy the remainder verbatim.
+                output.append(contentsOf: bytes[index...])
+                break
+            }
+
+            let length = cursor - index - 1
+            if length > threshold {
+                output.append(contentsOf: Array("\"[\(length) characters elided]\"".utf8))
+            } else {
+                output.append(contentsOf: bytes[index ... cursor])
+            }
+            index = cursor + 1
+        }
+
+        // Cutting only at quote bytes keeps multi-byte scalars intact.
+        return String(decoding: output, as: UTF8.self)
+    }
+
     /// Redacts sensitive HTTP headers
     public static func redactHeaders(_ headers: [String: String]) -> [String: String] {
         // Keys that should always be fully redacted (case-insensitive match)

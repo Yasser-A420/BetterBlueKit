@@ -17,7 +17,7 @@ struct HTTPLoggingTests {
     @Test("HTTPRequestType all cases")
     func testHTTPRequestTypeAllCases() {
         let allCases = HTTPRequestType.allCases
-        #expect(allCases.count == 8)
+        #expect(allCases.count == 10)
         #expect(allCases.contains(.login))
         #expect(allCases.contains(.fetchVehicles))
         #expect(allCases.contains(.fetchVehicleStatus))
@@ -26,6 +26,8 @@ struct HTTPLoggingTests {
         #expect(allCases.contains(.verifyMFA))
         #expect(allCases.contains(.fetchEVTripSummary))
         #expect(allCases.contains(.fetchEVTripInfo))
+        #expect(allCases.contains(.requestSurroundView))
+        #expect(allCases.contains(.fetchSurroundView))
     }
 
     @Test("HTTPRequestType display names")
@@ -36,6 +38,8 @@ struct HTTPLoggingTests {
         #expect(HTTPRequestType.sendCommand.displayName == "Send Command")
         #expect(HTTPRequestType.sendMFA.displayName == "Send MFA")
         #expect(HTTPRequestType.verifyMFA.displayName == "Verify MFA")
+        #expect(HTTPRequestType.requestSurroundView.displayName == "Request Surround View")
+        #expect(HTTPRequestType.fetchSurroundView.displayName == "Fetch Surround View")
     }
 
     @Test("HTTPRequestType raw values")
