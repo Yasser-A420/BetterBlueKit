@@ -51,8 +51,20 @@ public enum SensitiveDataRedactor {
             // Token/secret fields (handles escaped quotes)
             (#""(\#(tokenKeys))"\s*:\s*"(?:[^"\\]|\\.)*""#,
              "\"$1\":\"[REDACTED]\""),
-            // Latitude/longitude coordinates
-            (#""(latitude|longitude|lat|lng|lon)"\s*:\s*[-+]?\d+\.?\d*"#,
+            // Latitude/longitude coordinates. Two spellings are accepted:
+            // the bare keys, and any camelCase key ENDING in one of them —
+            // the surround-view payload reports position as
+            // `gpsDetail.coordLat` / `coordLon`, which the bare-key rule
+            // alone let through into persisted logs and debug exports.
+            // Requiring a capital on the prefixed form keeps innocent words
+            // like "flat" and "gallon" from matching.
+            //
+            // The value alternation is quoted-OR-bare rather than a pair of
+            // optional quotes: independent `"?` would happily match the
+            // opening quote of `"43.6abc"` and stop at the digits, leaving
+            // the tail behind as `"[REDACTED]"abc"` — malformed JSON in a
+            // persisted log and in every debug export built from it.
+            (#""((?:latitude|longitude|lat|lng|lon)|\w+(?:Latitude|Longitude|Lat|Lng|Lon))"\s*:\s*(?:"[-+]?\d+\.?\d*"|[-+]?\d+\.?\d*)"#,
              "\"$1\":\"[REDACTED]\""),
             // Coordinate pairs in arrays or objects
             (#"[-+]?\d{1,3}\.\d{3,10}\s*,\s*[-+]?\d{1,3}\.\d{3,10}"#,
@@ -173,8 +185,11 @@ public enum SensitiveDataRedactor {
             index = cursor + 1
         }
 
-        // Cutting only at quote bytes keeps multi-byte scalars intact.
-        return String(decoding: output, as: UTF8.self)
+        // Cutting only at quote bytes keeps multi-byte scalars intact, so
+        // this should never fail. If it somehow does, drop the body: the
+        // obvious fallback — returning `text` — would log the exact
+        // megabytes of base64 this function exists to remove.
+        return String(bytes: output, encoding: .utf8) ?? "[body omitted: could not be decoded]"
     }
 
     /// Redacts sensitive HTTP headers

@@ -54,7 +54,7 @@ extension HyundaiCanadaAPIClient {
     // MARK: - Request
 
     /// Sends one SVM call with the native-app identity, falling back
-    /// once to this client's web-portal headers.
+    /// once to this client's own login headers.
     ///
     /// Same rule as `fndmcr`: everything in the "find my car" family
     /// answers `from: SPA` (`locationHeaders`) and rejects `from: CWP`
@@ -62,6 +62,11 @@ extension HyundaiCanadaAPIClient {
     /// logged in with (BetterBlueKit#36). Verified on a live account —
     /// a capture request that 6459'd on the web-portal headers succeeded
     /// first try on these.
+    ///
+    /// SVM and `fndmcr` are the same remote-function family, so if the
+    /// location sweep has already learned this account answers only to
+    /// its own login identity, lead with that instead of re-paying the
+    /// rejection on every poll of a capture.
     ///
     /// The response is validated inside each attempt on purpose: this
     /// API signals refusal as HTTP 200 with `responseCode: 1` in the
@@ -74,33 +79,29 @@ extension HyundaiCanadaAPIClient {
         authCode: String,
         requestType: HTTPRequestType
     ) async throws -> Data {
-        do {
-            return try await sendSurroundViewRequest(
-                path: path,
-                vehicle: vehicle,
-                headers: locationHeaders(authToken: authToken, vehicleId: vehicle.regId, pAuth: authCode),
-                requestType: requestType
-            )
-        } catch let primaryError {
-            BBLogger.debug(
-                .api,
-                "HyundaiCanada: \(path) failed with authorized headers, retrying as native app: \(primaryError)"
-            )
+        let native = locationHeaders(authToken: authToken, vehicleId: vehicle.regId, pAuth: authCode)
+        let account = authorizedHeaders(authToken: authToken, vehicleId: vehicle.regId, pAuth: authCode)
+        let ordered = locationStrategy == .findMyCarAccount ? [account, native] : [native, account]
 
+        var firstError: Error?
+        for headers in ordered {
             do {
                 return try await sendSurroundViewRequest(
                     path: path,
                     vehicle: vehicle,
-                    headers: authorizedHeaders(authToken: authToken, vehicleId: vehicle.regId, pAuth: authCode),
+                    headers: headers,
                     requestType: requestType
                 )
             } catch {
-                // Surface the FIRST failure: the fallback is a guess, so
-                // its error is usually less informative than the one from
-                // the identity this account actually logs in with.
-                throw primaryError
+                firstError = firstError ?? error
+                BBLogger.debug(.api, "HyundaiCanada: \(path) failed, trying the other identity: \(error)")
             }
         }
+
+        // Surface the FIRST failure: the fallback is a guess, so its
+        // error is usually less informative than the one from the
+        // identity this account actually logs in with.
+        throw firstError ?? APIError.logError("Surround view request failed", apiName: apiName)
     }
 
     private func sendSurroundViewRequest(
@@ -169,8 +170,8 @@ extension HyundaiCanadaAPIClient {
             location: parseSurroundViewLocationCoordinates(gpsDetail),
             heading: extractNumber(from: gpsDetail?["head"]),
             doorOpen: parseSurroundViewDoors(location["doorOpen"] as? [String: Any]),
-            trunkOpen: location["trunkOpen"] as? Bool,
-            sideMirrorOpen: location["sidemirrorOpen"] as? Bool,
+            trunkOpen: parseSurroundViewFlag(location["trunkOpen"]),
+            sideMirrorOpen: parseSurroundViewFlag(location["sidemirrorOpen"]),
             frames: frames,
             tiles: SurroundViewDecoder.tiles(imageSize: imageSize, frameCount: frames.count)
         )
@@ -203,13 +204,26 @@ extension HyundaiCanadaAPIClient {
         return location.hasCoordinates ? location : nil
     }
 
+    /// Reads an open/closed flag that may arrive as a JSON boolean or as
+    /// 0/1. This region mixes the two even within one payload — the same
+    /// `unit` field is `true` under `dte` and `1` under `distanceToEmpty`
+    /// (BetterBlue#98) — so never bet on a bare `as? Bool`.
+    /// Returns nil only when the key is absent entirely.
+    private func parseSurroundViewFlag(_ value: Any?) -> Bool? {
+        guard let value, !(value is NSNull) else { return nil }
+        if let bool = value as? Bool { return bool }
+        if let number: Int = extractNumber(from: value) { return number != 0 }
+        if let string = value as? String {
+            return ["true", "1", "y", "yes", "open"].contains(string.lowercased())
+        }
+        return nil
+    }
+
     private func parseSurroundViewDoors(_ doors: [String: Any]?) -> VehicleStatus.DoorStatus? {
         guard let doors else { return nil }
 
         func isOpen(_ key: String) -> Bool {
-            if let bool = doors[key] as? Bool { return bool }
-            let value: Int = extractNumber(from: doors[key]) ?? 0
-            return value != 0
+            parseSurroundViewFlag(doors[key]) ?? false
         }
 
         return VehicleStatus.DoorStatus(

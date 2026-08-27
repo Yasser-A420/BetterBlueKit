@@ -34,10 +34,10 @@ public enum SurroundViewCameraPosition: String, Codable, Sendable, CaseIterable 
 
 /// A rectangle inside a JPEG frame, in pixels from the top-left.
 public struct SurroundViewCrop: Codable, Sendable, Equatable {
-    public let x: Int, y: Int, width: Int, height: Int
+    public let originX: Int, originY: Int, width: Int, height: Int
 
-    public init(x: Int, y: Int, width: Int, height: Int) {
-        (self.x, self.y, self.width, self.height) = (x, y, width, height)
+    public init(originX: Int, originY: Int, width: Int, height: Int) {
+        (self.originX, self.originY, self.width, self.height) = (originX, originY, width, height)
     }
 }
 
@@ -193,8 +193,8 @@ public enum SurroundViewDecoder {
                 position: cameraPosition(at: index),
                 frameIndex: 0,
                 crop: SurroundViewCrop(
-                    x: index * cameraWidth,
-                    y: 0,
+                    originX: index * cameraWidth,
+                    originY: 0,
                     width: cameraWidth,
                     height: min(cameraHeight, totalHeight)
                 )
@@ -205,8 +205,8 @@ public enum SurroundViewDecoder {
             position: .topDown,
             frameIndex: 0,
             crop: SurroundViewCrop(
-                x: cameraCount * cameraWidth,
-                y: 0,
+                originX: cameraCount * cameraWidth,
+                originY: 0,
                 width: topDownWidth,
                 height: min(topDownHeight, totalHeight)
             )

@@ -498,76 +498,6 @@ func fetchEVTripInfo(state: CLIState) async throws {
     }
 }
 
-// MARK: - Surround View
-
-@MainActor
-func requestSurroundView(state: CLIState) async throws {
-    guard let vehicle = selectVehicle(state: state) else { return }
-    guard let token = state.authToken else {
-        throw APIError(message: "Not logged in")
-    }
-    guard let client = state.client else {
-        throw APIError(message: "No API client initialized")
-    }
-
-    printSubheader("Requesting Surround View Capture for \(vehicle.model)")
-
-    try await client.requestSurroundViewCapture(for: vehicle, authToken: token)
-
-    printSuccess("Capture requested")
-    print("The vehicle now wakes its cameras, shoots, and uploads.")
-    print("Wait 1-2 minutes, then run command 13 to fetch the images.")
-}
-
-@MainActor
-func fetchSurroundView(state: CLIState) async throws {
-    guard let vehicle = selectVehicle(state: state) else { return }
-    guard let token = state.authToken else {
-        throw APIError(message: "Not logged in")
-    }
-    guard let client = state.client else {
-        throw APIError(message: "No API client initialized")
-    }
-
-    printSubheader("Fetching Surround View for \(vehicle.model)")
-
-    let captures = try await client.fetchSurroundViewCaptures(for: vehicle, authToken: token)
-    printSuccess("Found \(captures.count) capture(s)")
-
-    let outputDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("surround-view")
-
-    for (index, capture) in captures.enumerated() {
-        print("\n[\(index + 1)] Captured: \(capture.capturedAt.map(String.init(describing:)) ?? "unknown")")
-        print("    Frames: \(capture.frames.count) (\(capture.byteCount / 1024) KB)")
-        if let heading = capture.heading {
-            print("    Heading: \(heading)°")
-        }
-        if capture.location != nil {
-            print("    Location: [redacted — see HTTP log with --no-redaction]")
-        }
-        for tile in capture.tiles {
-            if let crop = tile.crop {
-                print("    Tile \(tile.position.displayName): "
-                    + "\(crop.width)x\(crop.height) at x=\(crop.x) in frame \(tile.frameIndex)")
-            } else {
-                print("    Tile \(tile.position.displayName): whole frame \(tile.frameIndex)")
-            }
-        }
-
-        for (frameIndex, frame) in capture.frames.enumerated() {
-            let stamp = capture.capturedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
-            let file = outputDirectory.appendingPathComponent("\(stamp)-frame\(frameIndex).jpg")
-            try FileManager.default.createDirectory(
-                at: outputDirectory,
-                withIntermediateDirectories: true
-            )
-            try frame.write(to: file)
-            print("    Wrote \(file.path)")
-        }
-    }
-}
-
 // MARK: - Interactive Menu
 
 func showMenu() {
@@ -589,6 +519,7 @@ func showMenu() {
      11. Fetch EV Trip Info
      12. Request Surround View Capture
      13. Fetch Surround View Images
+     14. Probe Vehicle Features (Kia US)
       0. Exit
 
     """)
@@ -641,6 +572,8 @@ func runInteractiveLoop(state: CLIState) async {
                 try await requestSurroundView(state: state)
             case "13":
                 try await fetchSurroundView(state: state)
+            case "14":
+                try await probeVehicleFeatures(state: state)
             case "0", "q", "quit", "exit":
                 print("\nGoodbye!")
                 return
@@ -882,55 +815,6 @@ func parseVehicles(client: any APIClientProtocol, data: Data, options: ParseOpti
         return try kiaUSA.parseVehiclesResponse(data)
     } else {
         throw APIError(message: "Unsupported client type for vehicle parsing")
-    }
-}
-
-@MainActor
-func parseSurroundView(
-    client: any APIClientProtocol,
-    data: Data,
-    vehicle: Vehicle
-) throws -> [SurroundViewCapture] {
-    guard let hyundaiCanada = client as? HyundaiCanadaAPIClient else {
-        throw APIError(message: "Unsupported client type for surround view parsing")
-    }
-    return try hyundaiCanada.parseCanadaSurroundViewResponse(data, for: vehicle)
-}
-
-/// Prints what each capture holds and writes its frames to disk, so a
-/// saved payload can be checked without a vehicle in the loop.
-/// Coordinates are deliberately not printed — the images and their GPS
-/// fix say exactly where the car (and usually its owner) was.
-func describeSurroundViewCaptures(_ captures: [SurroundViewCapture]) throws {
-    let outputDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("surround-view")
-
-    for (index, capture) in captures.enumerated() {
-        print("\n[\(index + 1)] Captured: \(capture.capturedAt.map(String.init(describing:)) ?? "unknown")")
-        print("    Frames: \(capture.frames.count) (\(capture.byteCount / 1024) KB)")
-        print("    Has location: \(capture.location != nil)")
-        if let heading = capture.heading {
-            print("    Heading: \(heading)°")
-        }
-        if let doors = capture.doorOpen {
-            print("    Doors open: \(doors.anyOpen ? doors.openDoorsDescription : "none")")
-        }
-        for tile in capture.tiles {
-            if let crop = tile.crop {
-                print("    Tile \(tile.position.displayName): "
-                    + "\(crop.width)x\(crop.height) at x=\(crop.x) in frame \(tile.frameIndex)")
-            } else {
-                print("    Tile \(tile.position.displayName): whole frame \(tile.frameIndex)")
-            }
-        }
-
-        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-        for (frameIndex, frame) in capture.frames.enumerated() {
-            let stamp = capture.capturedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
-            let file = outputDirectory.appendingPathComponent("\(stamp)-frame\(frameIndex).jpg")
-            try frame.write(to: file)
-            print("    Wrote \(file.path)")
-        }
     }
 }
 

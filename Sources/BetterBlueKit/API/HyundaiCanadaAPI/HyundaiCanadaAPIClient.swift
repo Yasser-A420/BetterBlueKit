@@ -55,6 +55,18 @@ public final class HyundaiCanadaAPIClient: APIClientBase, APIClientProtocol {
 
     var cloudFlareCookie: String?
 
+    // MARK: - Location Strategy State
+    //
+    // Which endpoint/header pairing this account's location works with
+    // varies (see `LocationStrategy`), so it is discovered once and
+    // reused. Per-instance, not persisted: the client is recreated on
+    // login, and re-discovering costs at most two extra calls.
+    var locationStrategy: LocationStrategy?
+    /// When the last full sweep ran, so an account where *nothing* works
+    /// backs off instead of sweeping on every status refresh.
+    var lastLocationSweep: Date?
+    static let locationSweepInterval: TimeInterval = 30 * 60
+
     // MARK: - MFA Flow State
     //
     // Hyundai Canada's MFA differs slightly from Kia USA's: the OTP key
@@ -221,53 +233,6 @@ public final class HyundaiCanadaAPIClient: APIClientBase, APIClientProtocol {
             BBLogger.debug(.api, "HyundaiCanada: failed injecting location: \(error)")
             return data
         }
-    }
-
-    /// Fetches the vehicle's location from `fndmcr` ("find my car"),
-    /// the same remote-function family as the surround-view endpoints.
-    ///
-    /// The web-portal variant used to call `evc/fme` here
-    /// (BetterBlueKit#36), but that endpoint now times out for every
-    /// request — no response at all, not an error payload — while
-    /// `fndmcr` answers normally — but only to the native-app identity.
-    /// Observed twice on a live account, minutes apart: the same second,
-    /// `from: CWP` draws errorCode 6459 while `from: SPA` returns the
-    /// coordinates. So lead with `locationHeaders` and keep the
-    /// web-portal set as the fallback rather than the other way round.
-    private func fetchLocationData(vehicle: Vehicle, authToken: AuthToken, pAuth: String) async throws -> Data {
-        do {
-            return try await sendLocationRequest(
-                vehicle: vehicle,
-                headers: locationHeaders(authToken: authToken, vehicleId: vehicle.regId, pAuth: pAuth)
-            )
-        } catch let primaryError {
-            BBLogger.debug(.api, "HyundaiCanada: fndmcr failed as native app, retrying with web-portal headers: \(primaryError)")
-
-            do {
-                return try await sendLocationRequest(
-                    vehicle: vehicle,
-                    headers: authorizedHeaders(authToken: authToken, vehicleId: vehicle.regId, pAuth: pAuth)
-                )
-            } catch {
-                throw primaryError
-            }
-        }
-    }
-
-    private func sendLocationRequest(vehicle: Vehicle, headers: [String: String]) async throws -> Data {
-        let (data, _, _) = try await performJSONRequest(
-            url: "\(apiBaseURL)/fndmcr",
-            method: .POST,
-            headers: headers,
-            body: ["pin": pin],
-            requestType: .fetchVehicleStatus,
-            vin: vehicle.vin
-        )
-
-        // Validated here so an API-level refusal (HTTP 200 with
-        // `responseCode: 1`) still trips the header fallback.
-        _ = try parseCanadaResponse(data, context: "location")
-        return data
     }
 
     public func sendCommand(for vehicle: Vehicle, command: VehicleCommand, authToken: AuthToken) async throws {

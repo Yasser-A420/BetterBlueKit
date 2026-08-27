@@ -85,9 +85,9 @@ struct SurroundViewTests {
 
         #expect(tiles.map(\.position) == [.front, .rear, .left, .right, .topDown])
         #expect(tiles.allSatisfy { $0.frameIndex == 0 })
-        #expect(tiles[0].crop == SurroundViewCrop(x: 0, y: 0, width: 960, height: 720))
-        #expect(tiles[3].crop == SurroundViewCrop(x: 2880, y: 0, width: 960, height: 720))
-        #expect(tiles[4].crop == SurroundViewCrop(x: 3840, y: 0, width: 632, height: 720))
+        #expect(tiles[0].crop == SurroundViewCrop(originX: 0, originY: 0, width: 960, height: 720))
+        #expect(tiles[3].crop == SurroundViewCrop(originX: 2880, originY: 0, width: 960, height: 720))
+        #expect(tiles[4].crop == SurroundViewCrop(originX: 3840, originY: 0, width: 632, height: 720))
 
         // The tiles must exactly cover the strip.
         let covered = tiles.compactMap(\.crop).reduce(0) { $0 + $1.width }
@@ -276,5 +276,140 @@ struct SurroundViewTests {
     func testSmallBodiesUnchanged() {
         let body = #"{"pin":"1234","escaped":"a \" quote"}"#
         #expect(SensitiveDataRedactor.elideOversizedValues(body) == body)
+    }
+
+    // MARK: - Redaction
+
+    /// SVM reports position as `coordLat`/`coordLon` rather than the
+    /// `lat`/`lon` the status endpoints use. The original rule matched
+    /// only the bare keys, so a capture's precise coordinates travelled
+    /// verbatim into persisted logs and debug exports.
+    @Test("Surround view coordinates are redacted")
+    func testSurroundViewCoordinatesRedacted() throws {
+        let body = #"{"gpsDetail":{"coordLat":43.653226,"coordLon":-79.383184,"head":93}}"#
+        let redacted = try #require(SensitiveDataRedactor.redact(body))
+
+        #expect(!redacted.contains("43.653226"))
+        #expect(!redacted.contains("-79.383184"))
+        // Heading is not a position on its own — keep it for debugging.
+        #expect(redacted.contains("\"head\":93"))
+    }
+
+    @Test("Bare and quoted coordinate spellings are still redacted")
+    func testCoordinateSpellingsRedacted() throws {
+        let body = #"{"lat":43.65,"lon":-79.38,"latitude":"43.65","vehicleLongitude":-79.38}"#
+        let redacted = try #require(SensitiveDataRedactor.redact(body))
+
+        #expect(!redacted.contains("43.65"))
+        #expect(!redacted.contains("-79.38"))
+    }
+
+    /// The prefixed form requires a capital, so ordinary words that
+    /// merely end in "lat"/"lon" keep their values.
+    @Test("Words ending in lat or lon are not mistaken for coordinates")
+    func testInnocentKeysSurvive() throws {
+        let body = #"{"flat":3,"gallon":12,"translation":7}"#
+        #expect(SensitiveDataRedactor.redact(body) == body)
+    }
+
+    /// Redaction output is persisted and re-parsed, so a rule that eats
+    /// an opening quote without its closing one corrupts the whole log.
+    /// A value that isn't a clean number must be left alone rather than
+    /// half-consumed.
+    @Test("Redaction never produces malformed JSON")
+    func testRedactionKeepsJSONValid() throws {
+        let bodies = [
+            #"{"coordLat":43.653226,"coordLon":-79.383184}"#,
+            #"{"coordLat":"43.65","coordLon":"-79.38"}"#,
+            #"{"lat":43.65,"lon":-79.38}"#,
+            #"{"coordLat":"43.6abc"}"#,
+            #"{"latitude":"","longitude":null}"#
+        ]
+
+        for body in bodies {
+            let redacted = try #require(SensitiveDataRedactor.redact(body))
+            #expect(
+                (try? JSONSerialization.jsonObject(with: Data(redacted.utf8))) != nil,
+                "redacting \(body) produced invalid JSON: \(redacted)"
+            )
+        }
+    }
+
+    /// Redaction runs over already-redacted text in some paths, so it has
+    /// to be idempotent — a second pass must not chew into the marker.
+    @Test("Redacting twice is the same as redacting once")
+    func testRedactionIdempotent() throws {
+        let body = #"{"gpsDetail":{"coordLat":43.653226,"coordLon":-79.383184}}"#
+        let once = try #require(SensitiveDataRedactor.redact(body))
+        #expect(SensitiveDataRedactor.redact(once) == once)
+    }
+
+    /// Elision runs before redaction. It must not swallow the
+    /// coordinates before the redactor can reach them.
+    @Test("A full SVM body is both elided and redacted")
+    func testFullPayloadElidedAndRedacted() throws {
+        let image = String(repeating: "A", count: 20_000)
+        let body = #"{"svmImage":"\#(image)","gpsDetail":{"coordLat":43.653226,"coordLon":-79.383184}}"#
+
+        let elided = try #require(SensitiveDataRedactor.elideOversizedValues(body))
+        let redacted = try #require(SensitiveDataRedactor.redact(elided))
+
+        #expect(!redacted.contains(image))
+        #expect(!redacted.contains("43.653226"))
+        #expect(!redacted.contains("-79.383184"))
+        #expect(try JSONSerialization.jsonObject(with: Data(redacted.utf8)) is [String: Any])
+    }
+
+    // MARK: - Flag tolerance
+
+    /// This region mixes JSON booleans and 0/1 for the same concept —
+    /// `unit` is `true` under `dte` but `1` under `distanceToEmpty`
+    /// (BetterBlue#98) — so the open/closed flags must accept both.
+    @Test("Open/closed flags accept booleans, numbers and strings")
+    @MainActor func testFlagsTolerateNumbers() throws {
+        let payload = Data("""
+        {
+          "responseHeader": {"responseDesc": "Success", "responseCode": 0},
+          "result": {"svmLocations": [{
+            "utcTime": "20260826003935",
+            "trunkOpen": 1,
+            "sidemirrorOpen": "false",
+            "doorOpen": {"frontLeft": true, "frontRight": 0, "backLeft": 1, "backRight": false},
+            "svmImage": "\(fakeJPEG(marker: 0x11).base64EncodedString())"
+          }]}
+        }
+        """.utf8)
+
+        let capture = try #require(
+            try makeClient().parseCanadaSurroundViewResponse(payload, for: makeVehicle()).first
+        )
+        #expect(capture.trunkOpen == true)
+        #expect(capture.sideMirrorOpen == false)
+        #expect(capture.doorOpen?.frontLeft == true)
+        #expect(capture.doorOpen?.frontRight == false)
+        #expect(capture.doorOpen?.backLeft == true)
+        #expect(capture.doorOpen?.backRight == false)
+    }
+
+    /// An absent flag stays nil so the UI can hide the row, rather than
+    /// claiming the trunk is closed when the payload never said.
+    @Test("A missing flag stays nil rather than defaulting to false")
+    @MainActor func testMissingFlagIsNil() throws {
+        let payload = Data("""
+        {
+          "responseHeader": {"responseDesc": "Success", "responseCode": 0},
+          "result": {"svmLocations": [{
+            "utcTime": "20260826003935",
+            "svmImage": "\(fakeJPEG(marker: 0x11).base64EncodedString())"
+          }]}
+        }
+        """.utf8)
+
+        let capture = try #require(
+            try makeClient().parseCanadaSurroundViewResponse(payload, for: makeVehicle()).first
+        )
+        #expect(capture.trunkOpen == nil)
+        #expect(capture.sideMirrorOpen == nil)
+        #expect(capture.doorOpen == nil)
     }
 }
