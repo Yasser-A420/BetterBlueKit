@@ -49,15 +49,16 @@ struct HyundaiUSASurroundViewTests {
         )
     }
 
-    /// One `svmDetail` shaped like the app's sample: nested coordinates,
-    /// 0/1 doors, a 14-digit timestamp, and the real 4472×720 imageSize.
+    /// One `svmDetail` shaped like the app's real sample: nested
+    /// coordinates, 0/1 doors, the timestamp under `gpsDetail.time` (the
+    /// real payload has no top-level `time`), and the real 4472×720
+    /// imageSize.
     private func makePayload(entries: [(time: String, marker: UInt8)]) -> Data {
         let details = entries.map { entry in
             """
             {"svmDetail": {
               "sidemirrorOpen": false,
               "trunkOpen": false,
-              "time": "\(entry.time)",
               "doorOpen": {"frontLeft": 0, "frontRight": 1, "backLeft": 0, "backRight": 0},
               "imageSize": [4472, 720, 960, 720, 632, 720],
               "gpsDetail": {
@@ -110,6 +111,25 @@ struct HyundaiUSASurroundViewTests {
 
         let expected = try #require(Calendar(identifier: .gregorian).date(from: components))
         #expect(capture.capturedAt == expected)
+    }
+
+    /// A capture taken without a GPS fix may drop `gpsDetail` entirely; the
+    /// timestamp then has to come from a top-level `time`, or every such
+    /// capture collapses onto the same "unknown" id and loses its order.
+    @Test("Timestamp falls back to a top-level time when gpsDetail is absent")
+    @MainActor func testTimestampFallsBackToTopLevel() throws {
+        let payload = Data("""
+        {"svmDetails": [{"svmDetail": {
+          "time": "20260826003935",
+          "svmImage": "\(fakeJPEG(marker: 0x11).base64EncodedString())"
+        }}]}
+        """.utf8)
+
+        let capture = try #require(
+            try makeClient().parseUSASurroundViewResponse(payload, for: makeVehicle()).first
+        )
+        #expect(capture.capturedAt != nil)
+        #expect(capture.location == nil)
     }
 
     @Test("Captures are returned newest first")

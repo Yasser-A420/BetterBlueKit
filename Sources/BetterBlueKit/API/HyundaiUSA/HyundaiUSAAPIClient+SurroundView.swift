@@ -124,7 +124,12 @@ extension HyundaiUSAAPIClient {
 
         return SurroundViewCapture(
             vin: vehicle.vin,
-            capturedAt: parseUSASurroundViewTimestamp(gpsDetail?["time"]),
+            // The real sample carries the stamp under `gpsDetail.time`, but
+            // read a top-level `time` first as the Canada client does: a
+            // capture taken without a GPS fix may drop `gpsDetail`, and
+            // without a fallback every such capture would land on the same
+            // "unknown" id and lose its order.
+            capturedAt: parseUSASurroundViewTimestamp(detail["time"] ?? gpsDetail?["time"]),
             location: parseUSASurroundViewLocation(gpsDetail),
             heading: heading,
             doorOpen: parseUSASurroundViewDoors(detail["doorOpen"] as? [String: Any]),
