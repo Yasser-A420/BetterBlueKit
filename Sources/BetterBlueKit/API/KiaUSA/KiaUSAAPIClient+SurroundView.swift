@@ -95,12 +95,18 @@ extension KiaUSAAPIClient {
 
         try checkForKiaErrors(data: data)
 
+        // Same nesting the status parser walks: the config hangs off the
+        // per-vehicle entry in `vehicleInfoList`, not off `payload`.
+        //
         // Surface the server's own status block when the tree is absent:
         // an unrecognised error code would otherwise reach the caller as
         // an empty dictionary, which reads as "no features" rather than
         // "the request was refused".
         guard let payload = json["payload"] as? [String: Any],
-              let config = payload["vehicleConfig"] as? [String: Any],
+              let vehicleInfoList = payload["vehicleInfoList"] as? [[String: Any]],
+              let vehicleInfo = vehicleInfoList.first(where: { $0["vinKey"] as? String == vehicle.vehicleKey })
+              ?? vehicleInfoList.first,
+              let config = vehicleInfo["vehicleConfig"] as? [String: Any],
               let features = config["vehicleFeature"] as? [String: Any] else {
             let status = (json["status"] as? [String: Any]).map { "\($0)" } ?? "no status block"
             throw APIError.logError(
@@ -114,16 +120,24 @@ extension KiaUSAAPIClient {
 
     /// Whether this vehicle advertises 360-view hardware.
     ///
-    /// Reads `vehicleFeature.locationFeature.surroundView`. That key path
-    /// comes from `huttotw/homebridge-kia-connect`, which types it against
-    /// a real Kia USA response — note Kia files it under `locationFeature`
-    /// beside `lastMile`, the same way Hyundai names its endpoint
+    /// Reads `vehicleFeature.locationFeature.surroundView`, confirmed
+    /// against a live Kia US account (a 2026 Carnival Hybrid, which
+    /// returned `"1"`). Kia files it under `locationFeature` beside
+    /// `lastMile`, the same way Hyundai names its endpoint
     /// `findMyCarSVM`: both treat remote cameras as a find-my-car feature
-    /// rather than a remote command.
+    /// rather than a remote command. Values arrive as the strings "1" and
+    /// "0", not booleans.
+    ///
+    /// - Warning: `remoteFeature.surroundViewMonitor` is a DIFFERENT flag
+    ///   and read it is not. The same vehicle reports `surroundView: "1"`
+    ///   and `surroundViewMonitor: "0"` in one response, so they cannot
+    ///   mean the same thing; the remote-command one appears to describe
+    ///   something the car does not have. Reading it instead would say
+    ///   "unsupported" for a vehicle whose owner uses the feature daily.
     ///
     /// Returns nil when the key is absent, which is NOT the same as false
-    /// — it means this build's guess about where the flag lives is wrong,
-    /// and the raw tree should be read instead.
+    /// — it means the flag has moved, and the raw tree should be read
+    /// instead.
     public func reportsSurroundView(for vehicle: Vehicle, authToken: AuthToken) async throws -> Bool? {
         let features = try await fetchVehicleFeatureTree(for: vehicle, authToken: authToken)
 
