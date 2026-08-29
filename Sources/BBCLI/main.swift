@@ -25,6 +25,21 @@ final class CLIState {
     var brand: Brand = .hyundai
     var region: Region = .usa
     var redactPII: Bool = false
+
+    /// This account's persisted device id and tokens.
+    var session = CLISession()
+    /// Set by `--forget`: clear the saved session instead of using it.
+    var forgetSession = false
+
+    /// Mutates the session and writes it straight through.
+    ///
+    /// Flushed immediately rather than at exit on purpose: the device id
+    /// and remember-me token are what the backend recognizes next launch,
+    /// and losing them to a crash or a Ctrl-C means another MFA prompt.
+    func updateSession(_ mutate: (inout CLISession) -> Void) {
+        mutate(&session)
+        SessionStore.save(session, brand: brand, region: region, username: username)
+    }
 }
 
 // MARK: - Helpers
@@ -119,6 +134,8 @@ func parseArguments(state: CLIState) {
                 }
                 argIndex += 1
             }
+        case "--forget":
+            state.forgetSession = true
         case "--no-redaction":
             state.redactPII = false
         case "-h", "--help":
@@ -146,6 +163,7 @@ func printUsage() {
       -b, --brand <brand>       Brand: 'hyundai' or 'kia' (default: hyundai)
       -r, --region <region>     Region: 'USA', 'Canada', 'Europe' (default: USA)
       --no-redaction            Disable PII redaction in HTTP logs
+      --forget                  Discard the saved session for this account and log in fresh
       -h, --help                Show this help message
 
     Parse Mode:
@@ -170,143 +188,6 @@ func printUsage() {
       bbcli parse -b kia -r US -t vehicles --electric response.json
       bbcli parse -b hyundai -r CA -t surroundView lastmcrsvm.json
     """)
-}
-
-// MARK: - Login Flow
-
-@MainActor
-func performLogin(state: CLIState) async throws {
-    let brand = state.brand
-    let region = state.region
-    let username = state.username
-    let password = state.password
-    let refreshToken = state.refreshToken
-    let pin = state.pin
-
-    printHeader("Login")
-    print("Brand: \(brand.displayName)")
-    print("Region: \(region.rawValue)")
-    print("Username: \(username)")
-    if state.redactPII == false {
-        print("⚠️  PII redaction disabled - sensitive data will be visible in logs")
-    }
-    print("")
-
-    // Create HTTP log sink for console output
-    let logSink: HTTPLogSink = { log in
-        printSubheader("HTTP \(log.requestType.displayName)")
-        print("[\(log.preciseTimestamp)] \(log.method) \(log.url)")
-        print("Duration: \(log.formattedDuration)")
-        if let status = log.responseStatus {
-            print("Status: \(status)")
-        }
-        if let error = log.error {
-            print("Error: \(error)")
-        }
-        if let apiError = log.apiError {
-            print("API Error: \(apiError)")
-        }
-        if let body = log.requestBody {
-            let formatted = prettyPrintJSON(body)
-            print("Request Body:\n\(formatted)")
-        }
-        if let body = log.responseBody {
-            let formatted = prettyPrintJSON(body)
-            let truncated = formatted.count > 4000
-                ? String(formatted.prefix(4000)) + "\n... (truncated)"
-                : formatted
-            print("Response Body:\n\(truncated)")
-        }
-    }
-
-    let config = APIClientConfiguration(
-        region: region,
-        brand: brand,
-        username: username,
-        password: password,
-        refreshToken: refreshToken.isEmpty ? nil : refreshToken,
-        pin: pin,
-        accountId: UUID(),
-        logSink: logSink,
-        redactPII: state.redactPII
-    )
-
-    let client: any APIClientProtocol
-    do {
-        client = try createBetterBlueKitAPIClient(configuration: config)
-    } catch let error as APIError {
-        printError("\(error.errorType): \(error.message)")
-        exit(1)
-    }
-
-    state.client = client
-
-    do {
-        print("Attempting login...")
-        _ = try await client.registerDevice()
-        let token = try await client.login()
-        state.authToken = token
-        printSuccess("Login successful!")
-        print("Auth token received (expires: \(token.expiresAt))")
-    } catch let error as APIError {
-        if error.errorType == .requiresMFA, client.supportsMFA() {
-            try await handleMFA(client: client, error: error, state: state)
-        } else {
-            throw error
-        }
-    }
-}
-
-@MainActor
-func handleMFA(client: any APIClientProtocol, error: APIError, state: CLIState) async throws {
-    printSubheader("MFA Required")
-
-    guard let userInfo = error.userInfo else {
-        throw APIError(message: "MFA required but no user info provided")
-    }
-
-    let xid = userInfo["xid"] ?? ""
-    let otpKey = userInfo["otpKey"] ?? ""
-    let email = userInfo["email"]
-    let phone = userInfo["phone"]
-
-    print("Available MFA methods:")
-    if let email = email {
-        print("  1. Email: \(email)")
-    }
-    if let phone = phone {
-        print("  2. Phone: \(phone)")
-    }
-
-    let methodChoice = prompt("Select method (1 for email, 2 for phone): ")
-    let method: MFAMethod = methodChoice == "2" ? .sms : .email
-
-    print("Sending MFA code via \(method)...")
-    try await client.sendMFACode(xid: xid, otpKey: otpKey, method: method)
-    printSuccess("MFA code sent!")
-
-    let rawCode = prompt("Enter verification code: ")
-    // Filter to digits only - OTP codes are always numeric, and terminal escape sequences
-    // can sometimes be captured by readLine()
-    let code = rawCode.filter { $0.isNumber }
-
-    if code.isEmpty {
-        throw APIError(message: "No verification code entered")
-    }
-
-    if code != rawCode {
-        print("Note: Cleaned input from '\\(rawCode)' to '\\(code)'")
-    }
-
-    print("Verifying MFA code...")
-    let (rmToken, sid) = try await client.verifyMFACode(xid: xid, otpKey: otpKey, code: code)
-    printSuccess("MFA verification successful!")
-
-    print("Completing login...")
-    let token = try await client.completeMFALogin(sid: sid, rmToken: rmToken)
-    state.authToken = token
-    printSuccess("Login completed!")
-    print("Auth token received (expires: \(token.expiresAt))")
 }
 
 // MARK: - API Commands
@@ -523,9 +404,71 @@ func showMenu() {
      12. Request Surround View Capture
      13. Fetch Surround View Images
      14. Probe Vehicle Features (Kia US)
+     15. Probe 360 View Trigger (Kia US)
+     16. Confirm 360 View Trigger (Kia US)
       0. Exit
 
     """)
+}
+
+/// Prompts for climate options, then starts climate. Extracted from the
+/// menu dispatch verbatim — the prompting is why case 5 was multi-line.
+@MainActor
+func promptAndStartClimate(state: CLIState) async throws {
+    print("Climate options (press Enter for defaults):")
+    let tempStr = prompt("Temperature (default 72°F): ")
+    let temp = Double(tempStr) ?? 72.0
+    var options = ClimateOptions()
+    options.temperature = Temperature(value: temp, units: .fahrenheit)
+    try await sendCommand(.startClimate(options), description: "Start Climate", state: state)
+}
+
+/// Prompts for AC/DC charge limits, then applies them.
+@MainActor
+func promptAndSetChargeLimits(state: CLIState) async throws {
+    let acStr = prompt("AC Charge Limit (50-100): ")
+    let dcStr = prompt("DC Charge Limit (50-100): ")
+    let acLimit = Int(acStr) ?? 80
+    let dcLimit = Int(dcStr) ?? 80
+    try await sendCommand(
+        .setTargetSOC(acLevel: acLimit, dcLevel: dcLimit),
+        description: "Set Charge Limits",
+        state: state
+    )
+}
+
+/// Runs one menu selection. Split out of `runInteractiveLoop` so the
+/// dispatch table can keep growing without the loop tripping SwiftLint's
+/// cyclomatic-complexity cap — the loop owns prompting and error
+/// reporting, this owns "which command".
+///
+/// Returns false when the user asked to quit.
+@MainActor
+func runMenuChoice(_ choice: String, state: CLIState) async throws -> Bool {
+    switch choice {
+    case "1": try await fetchVehicles(state: state)
+    case "2": try await fetchVehicleStatus(state: state)
+    case "3": try await sendCommand(.lock, description: "Lock", state: state)
+    case "4": try await sendCommand(.unlock, description: "Unlock", state: state)
+    case "5": try await promptAndStartClimate(state: state)
+    case "6": try await sendCommand(.stopClimate, description: "Stop Climate", state: state)
+    case "7": try await sendCommand(.startCharge, description: "Start Charge", state: state)
+    case "8": try await sendCommand(.stopCharge, description: "Stop Charge", state: state)
+    case "9": try await promptAndSetChargeLimits(state: state)
+    case "10": try await fetchEVTripSummary(state: state)
+    case "11": try await fetchEVTripInfo(state: state)
+    case "12": try await requestSurroundView(state: state)
+    case "13": try await fetchSurroundView(state: state)
+    case "14": try await probeVehicleFeatures(state: state)
+    case "15": try await probeSurroundViewTrigger(state: state)
+    case "16": try await confirmSurroundViewTrigger(state: state)
+    case "0", "q", "quit", "exit":
+        print("\nGoodbye!")
+        return false
+    default:
+        printError("Invalid command")
+    }
+    return true
 }
 
 @MainActor
@@ -535,58 +478,17 @@ func runInteractiveLoop(state: CLIState) async {
         let choice = prompt("Enter command number: ")
 
         do {
-            switch choice {
-            case "1":
-                try await fetchVehicles(state: state)
-            case "2":
-                try await fetchVehicleStatus(state: state)
-            case "3":
-                try await sendCommand(.lock, description: "Lock", state: state)
-            case "4":
-                try await sendCommand(.unlock, description: "Unlock", state: state)
-            case "5":
-                print("Climate options (press Enter for defaults):")
-                let tempStr = prompt("Temperature (default 72°F): ")
-                let temp = Double(tempStr) ?? 72.0
-                var options = ClimateOptions()
-                options.temperature = Temperature(value: temp, units: .fahrenheit)
-                try await sendCommand(.startClimate(options), description: "Start Climate", state: state)
-            case "6":
-                try await sendCommand(.stopClimate, description: "Stop Climate", state: state)
-            case "7":
-                try await sendCommand(.startCharge, description: "Start Charge", state: state)
-            case "8":
-                try await sendCommand(.stopCharge, description: "Stop Charge", state: state)
-            case "9":
-                let acStr = prompt("AC Charge Limit (50-100): ")
-                let dcStr = prompt("DC Charge Limit (50-100): ")
-                let acLimit = Int(acStr) ?? 80
-                let dcLimit = Int(dcStr) ?? 80
-                try await sendCommand(
-                    .setTargetSOC(acLevel: acLimit, dcLevel: dcLimit),
-                    description: "Set Charge Limits",
-                    state: state
-                )
-            case "10":
-                try await fetchEVTripSummary(state: state)
-            case "11":
-                try await fetchEVTripInfo(state: state)
-            case "12":
-                try await requestSurroundView(state: state)
-            case "13":
-                try await fetchSurroundView(state: state)
-            case "14":
-                try await probeVehicleFeatures(state: state)
-            case "0", "q", "quit", "exit":
-                print("\nGoodbye!")
-                return
-            default:
-                printError("Invalid command")
-            }
+            guard try await runMenuChoice(choice, state: state) else { return }
         } catch let error as APIError {
             printError("\(error.errorType): \(error.message)")
             if let userInfo = error.userInfo {
                 print("User Info: \(userInfo)")
+            }
+            // A reused session the server has since invalidated fails on
+            // every command with no obvious way out — unlike the app, the
+            // CLI has no re-authenticate-and-retry. Point at the exit.
+            if error.errorType == .invalidVehicleSession || error.errorType == .invalidCredentials {
+                print("\nThe saved session looks stale. Re-run with `--forget` to log in fresh.")
             }
         } catch {
             printError(error.localizedDescription)
@@ -857,6 +759,12 @@ func runCLI() async -> Int32 {
         let rawPin = prompt("PIN: ")
         // Filter to digits only - PIN should be numeric
         state.pin = rawPin.filter { $0.isNumber }
+    }
+
+    if state.forgetSession {
+        SessionStore.clear(brand: state.brand, region: state.region, username: state.username)
+        printSuccess("Cleared the saved session for \(state.username).")
+        print("A new device id will be registered on the next login, so expect one MFA prompt.")
     }
 
     // Perform login

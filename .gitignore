@@ -19,3 +19,7 @@ build/
 
 # SwiftLint config is checked in (see .swiftlint.yml) so contributors
 # share the same lint rules.
+
+# Frames dumped by `bbcli` menu 13. These are real photographs of
+# wherever the vehicle was parked — never commit them.
+surround-view/
