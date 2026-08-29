@@ -19,9 +19,11 @@
 //    lbs/svm/inquire — lists the captures the server holds, body `{}`.
 //                      Metadata ONLY: `svmId`, `imageViewed`, `status`
 //                      and `location.{coord,head,speed,syncDate}`.
-//    lbs/svm/info    — one capture's imagery, body `{svmId}`. The base64
+//    lbs/svm/info    — one capture in full, body `{svmId}`. The base64
 //                      lands in `payload.svmInfos[0].image` — note
-//                      `image`, not Hyundai's `svmImage`.
+//                      `image`, not Hyundai's `svmImage` — alongside the
+//                      `imageSize` strip descriptor, which `inquire` does
+//                      NOT carry.
 //    lbs/svm/dsi     — deletes captures, body `{svmIds: […]}`. Not used
 //                      here; recorded because it pins the verb family.
 //
@@ -176,17 +178,22 @@ extension KiaUSAAPIClient {
             }
 
             do {
-                let image = try await fetchSurroundViewImage(
+                let detail = try await fetchSurroundViewDetail(
                     svmId: svmId,
                     for: vehicle,
                     authToken: authToken
                 )
 
-                // Merge the imagery back into its metadata entry: `inquire`
-                // owns the timestamp and coordinates, `info` owns only the
-                // image, and the shared parser reads one dictionary.
+                // Overlay the detail onto its index entry so the parser
+                // reads one dictionary. `info` wins where the two overlap:
+                // it is the response that carries `imageSize`, and it
+                // repeats the location block anyway. Starting from the
+                // `inquire` entry rather than replacing it keeps anything
+                // the index reports and the detail happens to omit.
                 var merged = entry
-                merged["image"] = image
+                for (key, value) in detail {
+                    merged[key] = value
+                }
 
                 if let capture = SurroundViewCaptureParser.capture(
                     from: merged,
@@ -284,17 +291,24 @@ extension KiaUSAAPIClient {
         ) as? String ?? ""
     }
 
-    /// `lbs/svm/info` — one capture's base64 composite.
+    /// `lbs/svm/info` — one capture, in full.
+    ///
+    /// Returns the WHOLE entry rather than just the base64, because this
+    /// response carries more than `inquire` does — notably `imageSize`,
+    /// the authoritative `[totalW, totalH, frameW, frameH, topW, topH]`
+    /// strip descriptor. Reading only the image meant the geometry had to
+    /// be reconstructed from the JPEG header even though the server had
+    /// just stated it.
     ///
     /// `svmId` is passed back exactly as `inquire` reported it: the portal
     /// echoes the value unchanged (`var d={svmId:a.svmId}`), and coercing
     /// it to a String or an Int here would risk sending a type the server
     /// rejects.
-    private func fetchSurroundViewImage(
+    private func fetchSurroundViewDetail(
         svmId: Any,
         for vehicle: Vehicle,
         authToken: AuthToken
-    ) async throws -> String {
+    ) async throws -> [String: Any] {
         let (data, json, _) = try await performJSONRequest(
             url: "\(apiURL)lbs/svm/info",
             method: .POST,
@@ -306,13 +320,12 @@ extension KiaUSAAPIClient {
 
         try checkForKiaErrors(data: data)
 
-        guard let payload = json["payload"] as? [String: Any],
-              let infos = payload["svmInfos"] as? [[String: Any]],
-              let image = infos.first?["image"] as? String else {
+        guard let detail = try surroundViewEntries(in: json).first,
+              detail["image"] is String else {
             throw APIError.logError("Kia US 360 View response carried no image", apiName: apiName)
         }
 
-        return image
+        return detail
     }
 
     // MARK: - Parsing
@@ -324,13 +337,13 @@ extension KiaUSAAPIClient {
     /// image key is `image`, the fix hangs off `location` rather than
     /// `gpsDetail`, and the stamp is `location.syncDate.utc` — the same
     /// bare `yyyyMMddHHmmss` string every region uses, just one level
-    /// deeper. `imageSize` keeps its default key so a payload that does
-    /// carry the strip descriptor is tiled; when it is absent — which is
-    /// every Kia response, since the portal never reads one either —
-    /// `SurroundViewDecoder` reconstructs the geometry from the strip's
-    /// own SOF header. A live Carnival capture measures 4472×720, the
-    /// same layout Hyundai states outright, so the five camera views come
-    /// out correctly without this file hardcoding a single dimension.
+    /// deeper. `imageSize` keeps its default key because `lbs/svm/info`
+    /// does state it — `[4472, 720, 960, 720, 632, 720]` on a live
+    /// Carnival, the same layout Hyundai reports — even though
+    /// `lbs/svm/inquire` does not and the portal never reads one. That is
+    /// why the fetch merges the whole detail entry rather than just the
+    /// base64. When it is absent, `SurroundViewDecoder` reconstructs the
+    /// geometry from the strip's own SOF header instead.
     ///
     /// Heading sits at `location.head`, beside the fix rather than inside
     /// it — confirmed on a live capture, where two entries from the same

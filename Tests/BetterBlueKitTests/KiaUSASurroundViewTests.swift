@@ -346,11 +346,16 @@ struct KiaUSASurroundViewTests {
         AuthToken(accessToken: "sid", refreshToken: "", expiresAt: Date().addingTimeInterval(3600))
     }
 
+    /// Shaped like a real `lbs/svm/inquire` entry: no imagery and no
+    /// `imageSize` (that only arrives with `info`), but the full location
+    /// block including `head`.
     private func inquireBody(ids: [Int]) -> String {
         let infos = ids.map {
             """
-            {"svmId": \($0), "location": {"syncDate": {"utc": "2026082600393\($0 % 10)"},
-             "coord": {"lat": 42.27, "lon": -83.62}}}
+            {"svmId": \($0), "imageViewed": 1, "status": 0,
+             "location": {"syncDate": {"utc": "2026082600393\($0 % 10)", "offset": -5},
+              "coord": {"lat": 42.27, "lon": -83.62, "alt": 0, "altdo": 0, "type": 0},
+              "head": 67, "speed": {"value": 0, "unit": 0}}}
             """
         }.joined(separator: ",")
         return #"{"status":{"statusCode":0,"errorCode":0},"payload":{"svmInfos":[\#(infos)]}}"#
@@ -375,6 +380,96 @@ struct KiaUSASurroundViewTests {
         // One list call plus one image call per capture.
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/inquire") == 1)
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+    }
+
+    /// `lbs/svm/info` states `imageSize`; `lbs/svm/inquire` does not. The
+    /// fetch must merge the whole detail entry so the parser sees the
+    /// server's own geometry, rather than reconstructing it from the JPEG
+    /// header and hoping the two agree.
+    ///
+    /// Proven with a geometry that does NOT match the reference layout, so
+    /// inference could not have produced it: three 1120-wide panels plus a
+    /// 1112-wide bird's-eye. Feeding the same frame through the inference
+    /// path yields five 960-wide panels instead, so this can only pass if
+    /// the stated array was actually read.
+    @Test("A stated imageSize from lbs/svm/info is used, not inferred")
+    @MainActor func testStatedImageSizeIsMerged() async throws {
+        let image = sizedJPEG(width: 4472, height: 720).base64EncodedString()
+        StubProtocol.reset([
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1]))],
+            "lbs/svm/info": [(200, #"""
+            {"status":{"statusCode":0,"errorCode":0},"payload":{"svmInfos":[{
+              "svmId": 1,
+              "imageSize": [4472, 720, 1120, 720, 1112, 720],
+              "image": "\#(image)"
+            }]}}
+            """#)]
+        ])
+
+        let capture = try #require(
+            try await makeStubbedClient()
+                .fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+                .first
+        )
+
+        #expect(capture.tiles.count == 4)
+        #expect(capture.tiles.prefix(3).allSatisfy { $0.crop?.width == 1120 })
+        #expect(capture.tiles.last?.crop?.width == 1112)
+    }
+
+    /// The real shape: `info` states the same geometry Hyundai does.
+    @Test("The real Kia imageSize tiles into five camera views")
+    @MainActor func testRealStatedImageSize() async throws {
+        let image = sizedJPEG(width: 4472, height: 720).base64EncodedString()
+        StubProtocol.reset([
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1]))],
+            "lbs/svm/info": [(200, #"""
+            {"status":{"statusCode":0,"errorCode":0},"payload":{"svmInfos":[{
+              "svmId": 1,
+              "imageSize": [4472, 720, 960, 720, 632, 720],
+              "image": "\#(image)"
+            }]}}
+            """#)]
+        ])
+
+        let capture = try #require(
+            try await makeStubbedClient()
+                .fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+                .first
+        )
+
+        #expect(capture.tiles.map(\.position) == [.front, .rear, .left, .right, .topDown])
+        #expect(capture.tiles[0].crop?.width == 960)
+        #expect(capture.tiles[4].crop?.width == 632)
+    }
+
+    /// The index entry still supplies anything the detail omits — the
+    /// merge overlays, it does not replace.
+    @Test("Index metadata survives the merge when the detail omits it")
+    @MainActor func testIndexMetadataSurvivesMerge() async throws {
+        let image = sizedJPEG(width: 4472, height: 720).base64EncodedString()
+        StubProtocol.reset([
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1]))],
+            // Detail carries only the image — no location, no imageSize.
+            "lbs/svm/info": [(200, #"""
+            {"status":{"statusCode":0,"errorCode":0},"payload":{"svmInfos":[{
+              "svmId": 1, "image": "\#(image)"
+            }]}}
+            """#)]
+        ])
+
+        let capture = try #require(
+            try await makeStubbedClient()
+                .fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+                .first
+        )
+
+        // All three came from the inquire entry.
+        #expect(capture.heading == 67)
+        #expect(capture.location?.latitude == 42.27)
+        #expect(capture.capturedAt != nil)
+        // And with no stated imageSize, inference still covers the frame.
+        #expect(capture.tiles.count == 5)
     }
 
     /// A gallery that lists captures but whose imagery can't be fetched
