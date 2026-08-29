@@ -169,11 +169,26 @@ extension KiaUSAAPIClient {
         }
 
         var captures: [SurroundViewCapture] = []
+        var fetched: [String: SurroundViewCapture] = [:]
         var firstFailure: Error?
 
         for entry in entries {
             guard let svmId = entry["svmId"], !(svmId is NSNull) else {
                 BBLogger.warning(.api, "KiaUSA: skipping 360 View entry without an svmId")
+                continue
+            }
+
+            // A capture never changes once the vehicle has uploaded it, so
+            // its imagery only ever has to be downloaded once. That matters
+            // here in a way it does not for Hyundai: Kia bills one request
+            // AND ~280 KB of base64 PER CAPTURE, so a plain re-fetch of a
+            // full gallery is eleven requests and ~2.8 MB. The capture poll
+            // runs one of those every 30 s for up to six minutes, which was
+            // re-downloading the same unchanged images ~12 times over.
+            let cacheKey = "\(svmId)"
+            if let cached = surroundViewCache[cacheKey] {
+                captures.append(cached)
+                fetched[cacheKey] = cached
                 continue
             }
 
@@ -202,6 +217,7 @@ extension KiaUSAAPIClient {
                     apiName: apiName
                 ) {
                     captures.append(capture)
+                    fetched[cacheKey] = capture
                 }
             } catch let error as APIError where Self.isAuthFailure(error) {
                 // Bubble auth failures up immediately — BBAccount knows how
@@ -231,6 +247,11 @@ extension KiaUSAAPIClient {
         if captures.isEmpty, let firstFailure {
             throw firstFailure
         }
+
+        // Replace rather than merge, so a capture the owner deleted stops
+        // being held in memory. This bounds the cache to whatever the
+        // gallery currently holds — Kia retains ten.
+        surroundViewCache = fetched
 
         return captures.sorted {
             ($0.capturedAt ?? .distantPast) > ($1.capturedAt ?? .distantPast)

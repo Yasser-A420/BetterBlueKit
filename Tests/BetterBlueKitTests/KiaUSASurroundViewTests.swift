@@ -472,6 +472,85 @@ struct KiaUSASurroundViewTests {
         #expect(capture.tiles.count == 5)
     }
 
+    // MARK: - Image caching
+
+    /// The behaviour the HTTP log made obvious: a re-fetch was pulling
+    /// every image down again. Kia bills one request AND ~280 KB per
+    /// capture, and the capture poll re-fetches every 30 s for up to six
+    /// minutes, so an unchanged gallery was costing ~2.8 MB a poll.
+    ///
+    /// A capture is immutable once uploaded, so the second fetch must
+    /// re-list but download nothing.
+    @Test("Re-fetching an unchanged gallery downloads no imagery again")
+    @MainActor func testUnchangedGalleryIsNotRefetched() async throws {
+        StubProtocol.reset([
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1, 2, 3]))],
+            "lbs/svm/info": [(200, infoBody(marker: 0x11))]
+        ])
+
+        let client = makeStubbedClient()
+        let first = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(first.count == 3)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+
+        let second = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(second.count == 3)
+        // Still 3: the second pass re-listed but downloaded nothing.
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/inquire") == 2)
+    }
+
+    /// The capture poll's whole job: notice one new capture. It must cost
+    /// exactly one image download, not a whole gallery.
+    @Test("A new capture costs one image fetch, not a full gallery")
+    @MainActor func testOnlyNewCapturesAreFetched() async throws {
+        StubProtocol.reset([
+            "lbs/svm/inquire": [
+                (200, inquireBody(ids: [1, 2])),
+                (200, inquireBody(ids: [1, 2, 3]))
+            ],
+            "lbs/svm/info": [(200, infoBody(marker: 0x11))]
+        ])
+
+        let client = makeStubbedClient()
+        _ = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+
+        let after = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(after.count == 3)
+        // Only capture 3 was downloaded.
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+    }
+
+    /// A capture the owner deleted must not be held in memory forever —
+    /// the cache is replaced by what the gallery currently lists.
+    @Test("A deleted capture is dropped from the cache")
+    @MainActor func testDeletedCaptureIsEvicted() async throws {
+        StubProtocol.reset([
+            "lbs/svm/inquire": [
+                (200, inquireBody(ids: [1, 2])),
+                (200, inquireBody(ids: [2])),
+                (200, inquireBody(ids: [1, 2]))
+            ],
+            "lbs/svm/info": [(200, infoBody(marker: 0x11))]
+        ])
+
+        let client = makeStubbedClient()
+        _ = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+
+        // Capture 1 disappears from the gallery.
+        let shrunk = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(shrunk.count == 1)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+
+        // It comes back, so it has to be downloaded again — proving it was
+        // evicted rather than retained.
+        let restored = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(restored.count == 2)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+    }
+
     /// A gallery that lists captures but whose imagery can't be fetched
     /// must NOT look like an empty gallery. Returning [] there renders as
     /// "No Captures Yet" over a full gallery and hides the only clue a bug

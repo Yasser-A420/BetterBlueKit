@@ -282,6 +282,16 @@ public final class KiaUSAAPIClient: APIClientBase, APIClientProtocol {
     /// When the last SUCCESSFUL `rems/rvs` modem poll completed.
     private var lastRealTimeRefresh: Date?
 
+    /// Surround-view captures already assembled this session, keyed by
+    /// `svmId`.
+    ///
+    /// Lives here rather than in the `+SurroundView` extension only
+    /// because Swift extensions cannot hold stored properties. See
+    /// `fetchSurroundViewCaptures` for why it exists: a capture is
+    /// immutable once the vehicle has uploaded it, and its imagery is
+    /// ~280 KB of base64 behind its own request.
+    var surroundViewCache: [String: SurroundViewCapture] = [:]
+
     public func sendCommand(for vehicle: Vehicle, command: VehicleCommand, authToken: AuthToken) async throws {
         let url = commandURL(for: command)
         let body = commandBody(for: command, vehicle: vehicle)
