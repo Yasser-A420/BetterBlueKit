@@ -215,6 +215,117 @@ public enum SurroundViewDecoder {
         return tiles
     }
 
+    // MARK: - Geometry inference
+
+    /// The composite layout every region observed so far produces: four
+    /// fisheye panels followed by a narrower bird's-eye, all the full
+    /// height of the strip.
+    ///
+    /// Hyundai states it in `imageSize`. Kia sends no such field, but a
+    /// real Kia capture measures **4472×720** — identical — and Kia's own
+    /// app bundles debug frames at exactly 960×720 and 632×720, the panel
+    /// sizes below. So this is a confirmed layout shared across brands,
+    /// not a guess extrapolated from one of them.
+    private static let referenceStrip = (width: 4472, height: 720, camera: 960, topDown: 632)
+
+    /// How far a strip's aspect ratio may drift from the reference and
+    /// still be treated as the same layout. Tight on purpose: a payload
+    /// that is genuinely shaped differently must fall back to
+    /// "the frame is the image" rather than be cropped into nonsense.
+    private static let aspectTolerance = 0.01
+
+    /// Reads a JPEG's pixel dimensions from its start-of-frame header.
+    ///
+    /// Walks the marker segments rather than decoding — no image
+    /// framework, so this works identically on watchOS. Returns nil for
+    /// anything that isn't a JPEG whose header can be read, which is the
+    /// signal to fall back rather than to fail.
+    public static func pixelSize(ofJPEG data: Data) -> (width: Int, height: Int)? {
+        let bytes = [UInt8](data)
+        guard bytes.count > 4, bytes[0] == 0xFF, bytes[1] == 0xD8 else { return nil }
+
+        var index = 2
+        while index + 3 < bytes.count {
+            guard bytes[index] == 0xFF else {
+                index += 1
+                continue
+            }
+
+            let marker = bytes[index + 1]
+            // Fill bytes, and the standalone markers that carry no length.
+            if marker == 0xFF {
+                index += 1
+                continue
+            }
+            if marker == 0x01 || (0xD0 ... 0xD9).contains(marker) {
+                index += 2
+                continue
+            }
+
+            let length = Int(bytes[index + 2]) << 8 | Int(bytes[index + 3])
+            guard length >= 2 else { return nil }
+
+            // SOF0…SOF15 carry the frame size. C4/C8/CC are DHT/JPG/DAC,
+            // which share the range but describe something else.
+            if (0xC0 ... 0xCF).contains(marker), marker != 0xC4, marker != 0xC8, marker != 0xCC {
+                guard index + 8 < bytes.count else { return nil }
+                let height = Int(bytes[index + 5]) << 8 | Int(bytes[index + 6])
+                let width = Int(bytes[index + 7]) << 8 | Int(bytes[index + 8])
+                guard width > 0, height > 0 else { return nil }
+                return (width, height)
+            }
+
+            index += 2 + length
+        }
+
+        return nil
+    }
+
+    /// Rebuilds the `imageSize` a payload didn't send, from the strip's
+    /// own pixel dimensions.
+    ///
+    /// Only answers when the aspect ratio matches the reference layout, so
+    /// an unfamiliar composite stays whole instead of being sliced on a
+    /// guess. The bird's-eye width is taken as the REMAINDER rather than
+    /// scaled independently, which guarantees the result satisfies
+    /// `tiles(imageSize:frameCount:)`'s divisibility check exactly even
+    /// when scaling rounds.
+    public static func inferredImageSize(width: Int, height: Int) -> [Int]? {
+        guard width > 0, height > 0 else { return nil }
+
+        let reference = Double(referenceStrip.width) / Double(referenceStrip.height)
+        let actual = Double(width) / Double(height)
+        guard abs(actual - reference) / reference <= aspectTolerance else { return nil }
+
+        let scale = Double(height) / Double(referenceStrip.height)
+        let cameraWidth = Int((Double(referenceStrip.camera) * scale).rounded())
+        guard cameraWidth > 0 else { return nil }
+
+        let topDownWidth = width - cameraWidth * 4
+        guard topDownWidth > 0 else { return nil }
+
+        return [width, height, cameraWidth, height, topDownWidth, height]
+    }
+
+    /// Works out the tiling for a capture, falling back to the strip's own
+    /// dimensions when the payload carried no `imageSize`.
+    ///
+    /// This is what lets a region that reports no geometry — Kia — still
+    /// get its five camera views instead of one unreadable 6:1 strip.
+    public static func tiles(imageSize: [Int], frames: [Data]) -> [SurroundViewTile] {
+        if imageSize.count >= 6 {
+            return tiles(imageSize: imageSize, frameCount: frames.count)
+        }
+
+        guard frames.count == 1,
+              let size = pixelSize(ofJPEG: frames[0]),
+              let inferred = inferredImageSize(width: size.width, height: size.height) else {
+            return tiles(imageSize: imageSize, frameCount: frames.count)
+        }
+
+        return tiles(imageSize: inferred, frameCount: frames.count)
+    }
+
     private static func cameraPosition(at index: Int) -> SurroundViewCameraPosition {
         let order: [SurroundViewCameraPosition] = [.front, .rear, .left, .right]
         return index < order.count ? order[index] : .composite

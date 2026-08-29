@@ -101,7 +101,7 @@ public final class HyundaiCanadaAPIClient: APIClientBase, APIClientProtocol {
     // Declared here rather than in `+MFA` so one list covers every
     // optional capability the Canada client implements.
     public func optionalFeaturesSupported() -> [OptionalAPIFeature] {
-        [.mfa, .surroundView]
+        [.mfa, .surroundView, .surroundViewCapture]
     }
 
     public func login() async throws -> AuthToken {

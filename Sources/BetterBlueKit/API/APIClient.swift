@@ -197,9 +197,20 @@ public enum OptionalAPIFeature: String, Codable, Sendable, CaseIterable {
     case evTripSummary
     /// Per-trip drill-down for a specific date (`fetchEVTripInfo`).
     case evTripInfo
-    /// 360° camera stills on demand (`requestSurroundViewCapture` /
-    /// `fetchSurroundViewCaptures`).
+    /// Can show the 360° camera stills the server is holding
+    /// (`fetchSurroundViewCaptures`). This is what puts the Surround View
+    /// item in the vehicle menu.
     case surroundView
+    /// Can ask the vehicle to take a NEW 360° capture
+    /// (`requestSurroundViewCapture`).
+    ///
+    /// Separate from `.surroundView` because the two do not always come
+    /// together: Kia US can list and show captures the vehicle has
+    /// already uploaded, but its capture trigger is not known, so it
+    /// declares the gallery without the trigger and the app hides the
+    /// "New Capture" affordance. A client that can trigger must also be
+    /// able to fetch, so declare both.
+    case surroundViewCapture
 }
 
 // MARK: - Default Implementations
@@ -233,10 +244,16 @@ extension APIClientProtocol {
         optionalFeaturesSupported().contains(.mfa)
     }
 
-    /// Returns true if this API client can take and retrieve
-    /// surround-view camera captures
+    /// Returns true if this API client can retrieve the surround-view
+    /// captures the server is holding.
     public func supportsSurroundView() -> Bool {
         optionalFeaturesSupported().contains(.surroundView)
+    }
+
+    /// Returns true if this API client can ask the vehicle for a NEW
+    /// surround-view capture. Always a subset of `supportsSurroundView()`.
+    public func supportsSurroundViewCapture() -> Bool {
+        optionalFeaturesSupported().contains(.surroundViewCapture)
     }
 
     /// Returns the types of EV trip details this API client supports

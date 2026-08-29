@@ -115,7 +115,7 @@ public class FakeAPIClient: APIClientProtocol {
     // exercised in the simulator; the provider decides what imagery (if
     // any) comes back.
     public func optionalFeaturesSupported() -> [OptionalAPIFeature] {
-        [.surroundView]
+        [.surroundView, .surroundViewCapture]
     }
 
     public func requestSurroundViewCapture(for vehicle: Vehicle, authToken _: AuthToken) async throws {

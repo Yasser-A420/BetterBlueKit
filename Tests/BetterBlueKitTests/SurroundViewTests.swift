@@ -278,6 +278,98 @@ struct SurroundViewTests {
         #expect(SensitiveDataRedactor.elideOversizedValues(body) == body)
     }
 
+    // MARK: - Geometry inference
+
+    /// A JPEG carrying a real SOF0 header, so the decoder can read its
+    /// dimensions. Not a decodable image — only the header is ever parsed.
+    private func sizedJPEG(width: Int, height: Int, marker: UInt8 = 0x11) -> Data {
+        var data = Data([0xFF, 0xD8])
+        // An APP0 segment first, so the walk has to skip a length-carrying
+        // segment before it reaches the SOF.
+        data.append(contentsOf: [0xFF, 0xE0, 0x00, 0x04, marker, marker])
+        data.append(contentsOf: [
+            0xFF, 0xC0, 0x00, 0x11, 0x08,
+            UInt8(height >> 8), UInt8(height & 0xFF),
+            UInt8(width >> 8), UInt8(width & 0xFF)
+        ])
+        data.append(contentsOf: Array(repeating: marker, count: 8))
+        data.append(contentsOf: [0xFF, 0xD9])
+        return data
+    }
+
+    @Test("A JPEG's dimensions are read from its SOF header")
+    func testPixelSize() throws {
+        let size = try #require(SurroundViewDecoder.pixelSize(ofJPEG: sizedJPEG(width: 4472, height: 720)))
+        #expect(size.width == 4472)
+        #expect(size.height == 720)
+    }
+
+    @Test("Bytes that only look like a JPEG report no dimensions")
+    func testPixelSizeOfHeaderlessFrame() {
+        #expect(SurroundViewDecoder.pixelSize(ofJPEG: fakeJPEG(marker: 0x11)) == nil)
+        #expect(SurroundViewDecoder.pixelSize(ofJPEG: Data()) == nil)
+        #expect(SurroundViewDecoder.pixelSize(ofJPEG: Data([0xFF, 0xD8])) == nil)
+    }
+
+    /// A real Kia capture measures 4472x720 but carries no `imageSize`,
+    /// so the geometry has to come from the strip itself. The reconstructed
+    /// array must match what Hyundai states outright.
+    @Test("The reference strip's geometry is reconstructed from its dimensions")
+    func testInferredImageSize() throws {
+        let inferred = try #require(SurroundViewDecoder.inferredImageSize(width: 4472, height: 720))
+        #expect(inferred == [4472, 720, 960, 720, 632, 720])
+    }
+
+    /// The remainder rule has to keep the layout divisible at any scale,
+    /// including one where scaling the panel width rounds.
+    @Test("A scaled strip still tiles into five panels")
+    func testInferredImageSizeScales() throws {
+        let inferred = try #require(SurroundViewDecoder.inferredImageSize(width: 2236, height: 360))
+        #expect(inferred.count == 6)
+        let tiles = SurroundViewDecoder.tiles(imageSize: inferred, frameCount: 1)
+        #expect(tiles.count == 5)
+        #expect(tiles.map(\.position) == [.front, .rear, .left, .right, .topDown])
+    }
+
+    /// Anything not shaped like the known layout must stay whole rather
+    /// than be sliced on a guess.
+    @Test("An unfamiliar aspect ratio is not tiled")
+    func testUnfamiliarAspectNotInferred() {
+        #expect(SurroundViewDecoder.inferredImageSize(width: 1920, height: 1080) == nil)
+        #expect(SurroundViewDecoder.inferredImageSize(width: 4472, height: 1000) == nil)
+        #expect(SurroundViewDecoder.inferredImageSize(width: 0, height: 720) == nil)
+    }
+
+    @Test("A capture with no imageSize is tiled from the frame itself")
+    func testTilesFallBackToFrameDimensions() {
+        let tiles = SurroundViewDecoder.tiles(
+            imageSize: [],
+            frames: [sizedJPEG(width: 4472, height: 720)]
+        )
+
+        #expect(tiles.count == 5)
+        #expect(tiles.map(\.position) == [.front, .rear, .left, .right, .topDown])
+        #expect(tiles[0].crop?.width == 960)
+        #expect(tiles[4].crop?.width == 632)
+        #expect(tiles[4].crop?.originX == 3840)
+    }
+
+    /// A payload that DOES state its geometry must keep winning — the
+    /// inference is a fallback, never an override.
+    @Test("A stated imageSize takes precedence over the frame's dimensions")
+    func testStatedImageSizeWins() {
+        let tiles = SurroundViewDecoder.tiles(
+            imageSize: [4472, 720, 1120, 720, 1112, 720],
+            frames: [sizedJPEG(width: 4472, height: 720)]
+        )
+
+        // Three 1120-wide panels plus a 1112-wide bird's-eye — nothing
+        // like the inferred layout, which proves the stated array was used.
+        #expect(tiles.count == 4)
+        #expect(tiles.prefix(3).allSatisfy { $0.crop?.width == 1120 })
+        #expect(tiles.last?.crop?.width == 1112)
+    }
+
     // MARK: - Redaction
 
     /// SVM reports position as `coordLat`/`coordLon` rather than the
@@ -357,6 +449,32 @@ struct SurroundViewTests {
         #expect(!redacted.contains(image))
         #expect(!redacted.contains("43.653226"))
         #expect(!redacted.contains("-79.383184"))
+        #expect(try JSONSerialization.jsonObject(with: Data(redacted.utf8)) is [String: Any])
+    }
+
+    /// Kia's "360 View" envelope is a different shape again — the fix is
+    /// `location.coord.{lat,lon}` and the imagery hangs off `image`
+    /// rather than `svmImage`. Elision is size-based rather than
+    /// key-based, so it catches Kia's field name for free; the bare
+    /// `lat`/`lon` keys are already covered by the coordinate rule. Both
+    /// are asserted here so a change to either rule can't quietly
+    /// un-redact a Kia capture.
+    @Test("A full Kia 360 View body is both elided and redacted")
+    func testKiaPayloadElidedAndRedacted() throws {
+        let image = String(repeating: "A", count: 20_000)
+        let body = #"{"payload":{"svmInfos":[{"svmId":501,"image":"\#(image)","#
+            + #""location":{"syncDate":{"utc":"20260826003935","offset":-5},"#
+            + #""coord":{"lat":43.653226,"lon":-79.383184,"alt":254}}}]}}"#
+
+        let elided = try #require(SensitiveDataRedactor.elideOversizedValues(body))
+        let redacted = try #require(SensitiveDataRedactor.redact(elided))
+
+        #expect(!redacted.contains(image))
+        #expect(!redacted.contains("43.653226"))
+        #expect(!redacted.contains("-79.383184"))
+        // The capture's own identity and timestamp stay readable — they
+        // are what makes a log useful for triaging a missing capture.
+        #expect(redacted.contains("20260826003935"))
         #expect(try JSONSerialization.jsonObject(with: Data(redacted.utf8)) is [String: Any])
     }
 
