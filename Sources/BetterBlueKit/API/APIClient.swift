@@ -147,7 +147,27 @@ public protocol APIClientProtocol {
 
     /// Optional: Fetch the surround-view captures the server currently
     /// holds for a vehicle, newest first. Never triggers a new capture.
+    ///
+    /// Captures may come back WITHOUT imagery (`isLoaded == false`) where
+    /// a region bills for it per capture — see `fetchSurroundViewImagery`.
     func fetchSurroundViewCaptures(for vehicle: Vehicle, authToken: AuthToken) async throws -> [SurroundViewCapture]
+
+    /// Optional: Fill in one capture's imagery.
+    ///
+    /// Exists because regions differ in what a listing costs. Hyundai
+    /// returns every image inline, so its captures arrive loaded and this
+    /// is a no-op. Kia lists captures cheaply and bills a separate
+    /// request plus a few hundred KB per image, so it returns all but the
+    /// newest as metadata only and loads the rest on demand — which is
+    /// what lets the monitor screen open on one image instead of ten.
+    ///
+    /// Returns the capture unchanged when it is already loaded or the
+    /// region has nothing more to fetch, so callers can call it freely.
+    func fetchSurroundViewImagery(
+        for capture: SurroundViewCapture,
+        vehicle: Vehicle,
+        authToken: AuthToken
+    ) async throws -> SurroundViewCapture
 
     /// The optional capabilities this client implements, beyond the required
     /// protocol surface. Clients override this single method; callers use the
@@ -233,6 +253,16 @@ extension APIClientProtocol {
         authToken: AuthToken
     ) async throws -> [SurroundViewCapture] {
         []
+    }
+
+    /// Default: nothing more to fetch. Correct for every region that
+    /// returns imagery inline with the listing.
+    public func fetchSurroundViewImagery(
+        for capture: SurroundViewCapture,
+        vehicle _: Vehicle,
+        authToken _: AuthToken
+    ) async throws -> SurroundViewCapture {
+        capture
     }
 
     public func optionalFeaturesSupported() -> [OptionalAPIFeature] {

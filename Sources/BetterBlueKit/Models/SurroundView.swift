@@ -74,13 +74,31 @@ public struct SurroundViewCapture: Identifiable, Sendable {
     public let sideMirrorOpen: Bool?
     /// The JPEG frames the payload carried. Usually one wide composite
     /// strip; some payloads concatenate one JPEG per camera instead.
+    /// Empty until the imagery has been fetched — see `isLoaded`.
     public let frames: [Data]
     /// How to read `frames` as individual camera views.
     public let tiles: [SurroundViewTile]
+    /// The brand's own identifier for this capture, when it has one, used
+    /// to request the imagery separately.
+    ///
+    /// Only regions that bill imagery per capture set this. Hyundai
+    /// returns every image inline with the list, so its captures arrive
+    /// loaded and carry no provider id; Kia lists captures with
+    /// `lbs/svm/inquire` and fetches each `svmId` through `lbs/svm/info`.
+    public let providerID: String?
 
     public var id: String {
         "\(vin)-\(capturedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown")"
     }
+
+    /// Whether this capture's imagery has actually been fetched.
+    ///
+    /// A capture can exist as metadata alone — timestamp, location,
+    /// heading — while its images are still on the server. Callers that
+    /// need pixels should load it first (see
+    /// `APIClientProtocol.fetchSurroundViewImagery`); callers that only
+    /// need to list or order captures can use it as it is.
+    public var isLoaded: Bool { !frames.isEmpty }
 
     public var isEmpty: Bool { frames.isEmpty }
 
@@ -97,7 +115,8 @@ public struct SurroundViewCapture: Identifiable, Sendable {
         trunkOpen: Bool? = nil,
         sideMirrorOpen: Bool? = nil,
         frames: [Data],
-        tiles: [SurroundViewTile]
+        tiles: [SurroundViewTile],
+        providerID: String? = nil
     ) {
         self.vin = vin
         self.capturedAt = capturedAt
@@ -108,12 +127,33 @@ public struct SurroundViewCapture: Identifiable, Sendable {
         self.sideMirrorOpen = sideMirrorOpen
         self.frames = frames
         self.tiles = tiles
+        self.providerID = providerID
+    }
+
+    /// The same capture with imagery attached. Everything else is
+    /// carried over, so metadata read from a listing survives a load that
+    /// reports less than the listing did.
+    public func loaded(frames: [Data], tiles: [SurroundViewTile]) -> SurroundViewCapture {
+        SurroundViewCapture(
+            vin: vin,
+            capturedAt: capturedAt,
+            location: location,
+            heading: heading,
+            doorOpen: doorOpen,
+            trunkOpen: trunkOpen,
+            sideMirrorOpen: sideMirrorOpen,
+            frames: frames,
+            tiles: tiles,
+            providerID: providerID
+        )
     }
 }
 
 // Identity-based equality on purpose: the synthesized version would
 // byte-compare megabytes of JPEG on every SwiftUI diff.
 extension SurroundViewCapture: Equatable {
+    // byteCount is part of it so a placeholder and its loaded form differ,
+    // which is what makes SwiftUI redraw when imagery arrives.
     public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.id == rhs.id && lhs.byteCount == rhs.byteCount
     }

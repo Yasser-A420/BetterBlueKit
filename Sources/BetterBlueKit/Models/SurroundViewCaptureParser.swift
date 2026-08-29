@@ -139,6 +139,7 @@ public enum SurroundViewCaptureParser {
         from entry: [String: Any],
         vin: String,
         shape: EntryShape = EntryShape(),
+        providerID: String? = nil,
         apiName: String
     ) -> SurroundViewCapture? {
         guard let encoded = value(in: entry, at: shape.image) as? String,
@@ -156,7 +157,30 @@ public enum SurroundViewCaptureParser {
         let imageSize = (value(in: entry, at: shape.imageSize) as? [Any])?
             .compactMap { extractNumber(from: $0) as Int? } ?? []
 
-        return SurroundViewCapture(
+        // Pass the frames, not just the count: a region that sends no
+        // `imageSize` (Kia's `inquire`) still gets its five camera views,
+        // inferred from the strip's own pixel dimensions.
+        return metadata(from: entry, vin: vin, shape: shape, providerID: providerID)
+            .loaded(frames: frames, tiles: SurroundViewDecoder.tiles(imageSize: imageSize, frames: frames))
+    }
+
+    /// Parses one entry's METADATA, without requiring any imagery.
+    ///
+    /// This is what makes a lazily-loaded gallery possible: a region that
+    /// bills imagery per capture (Kia) can list every capture from its
+    /// index response and fetch pixels only for the ones actually looked
+    /// at. The result reports `isLoaded == false` until it is filled in
+    /// with `SurroundViewCapture.loaded(frames:tiles:)`.
+    ///
+    /// Unlike `capture(from:)` this never returns nil — an entry with no
+    /// imagery is exactly the case it exists to describe.
+    public static func metadata(
+        from entry: [String: Any],
+        vin: String,
+        shape: EntryShape = EntryShape(),
+        providerID: String? = nil
+    ) -> SurroundViewCapture {
+        SurroundViewCapture(
             vin: vin,
             capturedAt: timestamp(value(in: entry, at: shape.timestamp)),
             location: location(in: entry, shape: shape),
@@ -164,11 +188,9 @@ public enum SurroundViewCaptureParser {
             doorOpen: doors(value(in: entry, at: shape.doors) as? [String: Any], keys: shape.doorKeys),
             trunkOpen: flag(value(in: entry, at: shape.trunkOpen)),
             sideMirrorOpen: flag(value(in: entry, at: shape.sideMirrorOpen)),
-            frames: frames,
-            // Pass the frames, not just the count: a region that sends no
-            // `imageSize` (Kia) still gets its five camera views, inferred
-            // from the strip's own pixel dimensions.
-            tiles: SurroundViewDecoder.tiles(imageSize: imageSize, frames: frames)
+            frames: [],
+            tiles: [],
+            providerID: providerID
         )
     }
 

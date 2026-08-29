@@ -366,8 +366,33 @@ struct KiaUSASurroundViewTests {
         return #"{"status":{"statusCode":0,"errorCode":0},"payload":{"svmInfos":[{"image":"\#(image)"}]}}"#
     }
 
-    @Test("The inquire → info flow assembles captures")
-    @MainActor func testThreeCallFlow() async throws {
+    /// Opening the gallery lists everything but downloads ONE image.
+    /// Kia bills a request and a few hundred KB per capture, so loading
+    /// all ten up front spends ~2.8 MB on nine pictures nobody asked to
+    /// see.
+    @Test("Listing loads only the newest capture's imagery")
+    @MainActor func testListingLoadsOnlyNewest() async throws {
+        StubProtocol.reset([
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1, 2, 3]))],
+            "lbs/svm/info": [(200, infoBody(marker: 0x11))]
+        ])
+
+        let captures = try await makeStubbedClient()
+            .fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+
+        #expect(captures.count == 3)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/inquire") == 1)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
+
+        // The newest is ready to show; the rest are metadata awaiting a tap.
+        #expect(captures[0].isLoaded)
+        #expect(captures.dropFirst().allSatisfy { !$0.isLoaded })
+    }
+
+    /// A capture without imagery still has to be listable and orderable —
+    /// the history menu shows its timestamp before anything is fetched.
+    @Test("Unloaded captures still carry their metadata")
+    @MainActor func testUnloadedCapturesCarryMetadata() async throws {
         StubProtocol.reset([
             "lbs/svm/inquire": [(200, inquireBody(ids: [1, 2]))],
             "lbs/svm/info": [(200, infoBody(marker: 0x11))]
@@ -376,10 +401,62 @@ struct KiaUSASurroundViewTests {
         let captures = try await makeStubbedClient()
             .fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
 
-        #expect(captures.count == 2)
-        // One list call plus one image call per capture.
-        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/inquire") == 1)
+        let older = try #require(captures.last)
+        #expect(!older.isLoaded)
+        #expect(older.capturedAt != nil)
+        #expect(older.heading == 67)
+        #expect(older.location?.latitude == 42.27)
+        #expect(older.providerID == "1")
+    }
+
+    /// Selecting an older capture fetches exactly its own image.
+    @Test("Imagery loads on demand, once")
+    @MainActor func testImageryLoadsOnDemand() async throws {
+        StubProtocol.reset([
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1, 2]))],
+            "lbs/svm/info": [(200, infoBody(marker: 0x11))]
+        ])
+
+        let client = makeStubbedClient()
+        let captures = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        let older = try #require(captures.last)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
+
+        let loaded = try await client.fetchSurroundViewImagery(
+            for: older, vehicle: makeVehicle(), authToken: stubToken
+        )
+        #expect(loaded.isLoaded)
+        #expect(loaded.id == older.id)
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+
+        // Re-selecting it costs nothing.
+        let again = try await client.fetchSurroundViewImagery(
+            for: older, vehicle: makeVehicle(), authToken: stubToken
+        )
+        #expect(again.isLoaded)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+    }
+
+    /// Callers shouldn't have to check before calling — an already-loaded
+    /// capture is returned untouched, with no request.
+    @Test("Loading an already-loaded capture is a no-op")
+    @MainActor func testLoadingLoadedCaptureIsNoOp() async throws {
+        StubProtocol.reset([
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1]))],
+            "lbs/svm/info": [(200, infoBody(marker: 0x11))]
+        ])
+
+        let client = makeStubbedClient()
+        let newest = try #require(
+            try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken).first
+        )
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
+
+        let same = try await client.fetchSurroundViewImagery(
+            for: newest, vehicle: makeVehicle(), authToken: stubToken
+        )
+        #expect(same.id == newest.id)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
     }
 
     /// `lbs/svm/info` states `imageSize`; `lbs/svm/inquire` does not. The
@@ -474,14 +551,9 @@ struct KiaUSASurroundViewTests {
 
     // MARK: - Image caching
 
-    /// The behaviour the HTTP log made obvious: a re-fetch was pulling
-    /// every image down again. Kia bills one request AND ~280 KB per
-    /// capture, and the capture poll re-fetches every 30 s for up to six
-    /// minutes, so an unchanged gallery was costing ~2.8 MB a poll.
-    ///
-    /// A capture is immutable once uploaded, so the second fetch must
-    /// re-list but download nothing.
-    @Test("Re-fetching an unchanged gallery downloads no imagery again")
+    /// A capture is immutable once uploaded, so re-listing must not
+    /// re-download the one image it does load.
+    @Test("Re-listing an unchanged gallery downloads no imagery again")
     @MainActor func testUnchangedGalleryIsNotRefetched() async throws {
         StubProtocol.reset([
             "lbs/svm/inquire": [(200, inquireBody(ids: [1, 2, 3]))],
@@ -489,20 +561,20 @@ struct KiaUSASurroundViewTests {
         ])
 
         let client = makeStubbedClient()
-        let first = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
-        #expect(first.count == 3)
-        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+        _ = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
 
         let second = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
         #expect(second.count == 3)
-        // Still 3: the second pass re-listed but downloaded nothing.
-        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+        #expect(second[0].isLoaded)
+        // Re-listed, downloaded nothing.
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/inquire") == 2)
     }
 
-    /// The capture poll's whole job: notice one new capture. It must cost
-    /// exactly one image download, not a whole gallery.
-    @Test("A new capture costs one image fetch, not a full gallery")
+    /// What the capture poll costs: one listing, and one image only when
+    /// something new has actually landed.
+    @Test("A new capture costs one image fetch")
     @MainActor func testOnlyNewCapturesAreFetched() async throws {
         StubProtocol.reset([
             "lbs/svm/inquire": [
@@ -514,16 +586,18 @@ struct KiaUSASurroundViewTests {
 
         let client = makeStubbedClient()
         _ = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
-        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
 
         let after = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
         #expect(after.count == 3)
-        // Only capture 3 was downloaded.
-        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+        // Capture 3 is the new newest, so exactly one more download.
+        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
+        #expect(after[0].isLoaded)
     }
 
-    /// A capture the owner deleted must not be held in memory forever —
-    /// the cache is replaced by what the gallery currently lists.
+    /// A capture the owner deleted must not be held in memory forever.
+    /// Loaded on demand, then removed from the gallery, then restored — it
+    /// has to be downloaded again, which proves it was evicted.
     @Test("A deleted capture is dropped from the cache")
     @MainActor func testDeletedCaptureIsEvicted() async throws {
         StubProtocol.reset([
@@ -536,7 +610,11 @@ struct KiaUSASurroundViewTests {
         ])
 
         let client = makeStubbedClient()
-        _ = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        let first = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        // Newest (2) loaded eagerly; load the older one (1) on demand too.
+        _ = try await client.fetchSurroundViewImagery(
+            for: try #require(first.last), vehicle: makeVehicle(), authToken: stubToken
+        )
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
 
         // Capture 1 disappears from the gallery.
@@ -544,10 +622,12 @@ struct KiaUSASurroundViewTests {
         #expect(shrunk.count == 1)
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 2)
 
-        // It comes back, so it has to be downloaded again — proving it was
-        // evicted rather than retained.
+        // It comes back and is selected again — it must be re-downloaded.
         let restored = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
         #expect(restored.count == 2)
+        _ = try await client.fetchSurroundViewImagery(
+            for: try #require(restored.last), vehicle: makeVehicle(), authToken: stubToken
+        )
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
     }
 
@@ -592,24 +672,28 @@ struct KiaUSASurroundViewTests {
         #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 1)
     }
 
-    /// One bad image is still survivable — the rest of the history must
-    /// come back rather than the whole fetch failing.
-    @Test("A single failed image doesn't cost the rest of the history")
-    @MainActor func testPartialImageFailureSurvives() async throws {
+    /// An on-demand load reports its own failure rather than silently
+    /// handing back an unloaded capture — the screen has to be able to
+    /// tell the user why that picture didn't appear.
+    @Test("A failed on-demand load throws")
+    @MainActor func testFailedOnDemandLoadThrows() async throws {
         StubProtocol.reset([
-            "lbs/svm/inquire": [(200, inquireBody(ids: [1, 2, 3]))],
-            // First image is unusable; the rest resolve.
+            "lbs/svm/inquire": [(200, inquireBody(ids: [1, 2]))],
             "lbs/svm/info": [
-                (200, #"{"status":{"statusCode":0,"errorCode":0},"payload":{}}"#),
-                (200, infoBody(marker: 0x22))
+                (200, infoBody(marker: 0x11)),
+                (200, #"{"status":{"statusCode":0,"errorCode":0},"payload":{}}"#)
             ]
         ])
 
-        let captures = try await makeStubbedClient()
-            .fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        let client = makeStubbedClient()
+        let captures = try await client.fetchSurroundViewCaptures(for: makeVehicle(), authToken: stubToken)
+        let older = try #require(captures.last)
 
-        #expect(captures.count == 2)
-        #expect(StubProtocol.callCount(forPathSuffix: "lbs/svm/info") == 3)
+        await #expect(throws: APIError.self) {
+            try await client.fetchSurroundViewImagery(
+                for: older, vehicle: self.makeVehicle(), authToken: self.stubToken
+            )
+        }
     }
 
     // MARK: - Capability declaration

@@ -148,13 +148,25 @@ extension KiaUSAAPIClient {
         }
     }
 
+    /// Lists the captures the server holds, loading imagery only for the
+    /// newest.
+    ///
+    /// Kia bills a request AND a few hundred KB of base64 PER capture, so
+    /// loading a full gallery up front is eleven requests and ~2.8 MB for
+    /// nine pictures nobody has asked to see. The listing itself is cheap,
+    /// so everything but the newest comes back as metadata — timestamp,
+    /// location, heading — and the monitor screen fills each one in as the
+    /// user selects it, via `fetchSurroundViewImagery`.
+    ///
+    /// The newest IS loaded here, because that is the one the screen opens
+    /// on and the one the capture poll is waiting for.
     public func fetchSurroundViewCaptures(
         for vehicle: Vehicle,
         authToken: AuthToken
     ) async throws -> [SurroundViewCapture] {
         // Sort before truncating: nothing documents the order `inquire`
         // answers in, and taking the "first" ten of an oldest-first list
-        // would silently fetch the wrong decade of history. The stamps are
+        // would silently list the wrong decade of history. The stamps are
         // fixed-width `yyyyMMddHHmmss`, so a string sort IS a date sort.
         var entries = try await fetchSurroundViewIndex(for: vehicle, authToken: authToken)
             .sorted { syncStamp(of: $0) > syncStamp(of: $1) }
@@ -162,15 +174,14 @@ extension KiaUSAAPIClient {
         if entries.count > Self.maxSurroundViewCaptures {
             BBLogger.debug(
                 .api,
-                "KiaUSA: 360 View returned \(entries.count) captures, fetching the newest "
+                "KiaUSA: 360 View returned \(entries.count) captures, listing the newest "
                     + "\(Self.maxSurroundViewCaptures)"
             )
             entries = Array(entries.prefix(Self.maxSurroundViewCaptures))
         }
 
+        var index: [String: [String: Any]] = [:]
         var captures: [SurroundViewCapture] = []
-        var fetched: [String: SurroundViewCapture] = [:]
-        var firstFailure: Error?
 
         for entry in entries {
             guard let svmId = entry["svmId"], !(svmId is NSNull) else {
@@ -178,91 +189,94 @@ extension KiaUSAAPIClient {
                 continue
             }
 
-            // A capture never changes once the vehicle has uploaded it, so
-            // its imagery only ever has to be downloaded once. That matters
-            // here in a way it does not for Hyundai: Kia bills one request
-            // AND ~280 KB of base64 PER CAPTURE, so a plain re-fetch of a
-            // full gallery is eleven requests and ~2.8 MB. The capture poll
-            // runs one of those every 30 s for up to six minutes, which was
-            // re-downloading the same unchanged images ~12 times over.
-            let cacheKey = "\(svmId)"
-            if let cached = surroundViewCache[cacheKey] {
-                captures.append(cached)
-                fetched[cacheKey] = cached
-                continue
-            }
+            let providerID = "\(svmId)"
+            index[providerID] = entry
 
-            do {
-                let detail = try await fetchSurroundViewDetail(
-                    svmId: svmId,
-                    for: vehicle,
-                    authToken: authToken
-                )
-
-                // Overlay the detail onto its index entry so the parser
-                // reads one dictionary. `info` wins where the two overlap:
-                // it is the response that carries `imageSize`, and it
-                // repeats the location block anyway. Starting from the
-                // `inquire` entry rather than replacing it keeps anything
-                // the index reports and the detail happens to omit.
-                var merged = entry
-                for (key, value) in detail {
-                    merged[key] = value
-                }
-
-                if let capture = SurroundViewCaptureParser.capture(
-                    from: merged,
-                    vin: vehicle.vin,
-                    shape: Self.surroundViewShape,
-                    apiName: apiName
-                ) {
-                    captures.append(capture)
-                    fetched[cacheKey] = capture
-                }
-            } catch let error as APIError where Self.isAuthFailure(error) {
-                // Bubble auth failures up immediately — BBAccount knows how
-                // to re-authenticate and retry, and re-trying the remaining
-                // ids against a dead session just burns requests. Same rule
-                // `triggerRealTimeStatusRefresh` follows for `rems/rvs`.
-                throw error
-            } catch {
-                // One bad image must not cost the user the rest of the
-                // history: a single expired or half-uploaded id is
-                // survivable where a whole failed response is not. Logged
-                // at warning, not debug — a capture silently missing from
-                // the history is exactly the kind of thing that otherwise
-                // gets diagnosed as "the feature doesn't work".
-                BBLogger.warning(.api, "KiaUSA: 360 View image \(svmId) could not be fetched: \(error)")
-                firstFailure = firstFailure ?? error
-            }
+            // A capture never changes once uploaded, so imagery already
+            // fetched this session is reused rather than re-downloaded.
+            captures.append(
+                surroundViewCache[providerID]
+                    ?? SurroundViewCaptureParser.metadata(
+                        from: entry,
+                        vin: vehicle.vin,
+                        shape: Self.surroundViewShape,
+                        providerID: providerID
+                    )
+            )
         }
 
-        // "The gallery is empty" and "nothing could be fetched" must stay
-        // distinguishable. Returning [] for the second renders as "No
-        // Captures Yet" over a full gallery, and hides the one thing a
-        // report would need — which matters most while the endpoints are
-        // still unverified against a live account, since a response that
-        // nests the image somewhere other than `payload.svmInfos[0].image`
-        // would otherwise look exactly like a car that has never taken one.
-        if captures.isEmpty, let firstFailure {
-            throw firstFailure
-        }
-
+        surroundViewIndex = index
         // Replace rather than merge, so a capture the owner deleted stops
         // being held in memory. This bounds the cache to whatever the
-        // gallery currently holds — Kia retains ten.
-        surroundViewCache = fetched
+        // gallery currently lists — Kia retains ten.
+        surroundViewCache = surroundViewCache.filter { index[$0.key] != nil }
 
-        return captures.sorted {
-            ($0.capturedAt ?? .distantPast) > ($1.capturedAt ?? .distantPast)
+        captures.sort { ($0.capturedAt ?? .distantPast) > ($1.capturedAt ?? .distantPast) }
+
+        // Load the newest eagerly. Failures here propagate rather than
+        // yielding a gallery that renders as "no captures yet" — that
+        // distinction is the whole reason the eager version threw.
+        if let newest = captures.first, !newest.isLoaded {
+            captures[0] = try await fetchSurroundViewImagery(
+                for: newest,
+                vehicle: vehicle,
+                authToken: authToken
+            )
         }
+
+        return captures
     }
 
-    /// Whether an error means "the session is dead", the one class the
-    /// per-image loop must not swallow. Mirrors the errors
-    /// `BBAccount.shouldReauthenticate` acts on.
-    private static func isAuthFailure(_ error: APIError) -> Bool {
-        error.errorType == .invalidCredentials || error.errorType == .invalidVehicleSession
+    /// Fills in one capture's imagery, on demand.
+    ///
+    /// Returns the capture untouched when it is already loaded or carries
+    /// no `svmId` to ask about, so the monitor screen can call this for
+    /// whatever the user selected without checking first.
+    public func fetchSurroundViewImagery(
+        for capture: SurroundViewCapture,
+        vehicle: Vehicle,
+        authToken: AuthToken
+    ) async throws -> SurroundViewCapture {
+        guard !capture.isLoaded, let providerID = capture.providerID else { return capture }
+        if let cached = surroundViewCache[providerID] { return cached }
+
+        // Send the id back with the TYPE the server used — `inquire`
+        // reports a JSON number, and the portal echoes `a.svmId`
+        // untouched. `providerID` is its string form, only ever a
+        // dictionary key; stringifying it on the wire risks a rejection.
+        let indexEntry = surroundViewIndex[providerID]
+        let detail = try await fetchSurroundViewDetail(
+            svmId: indexEntry?["svmId"] ?? providerID,
+            for: vehicle,
+            authToken: authToken
+        )
+
+        // Overlay the detail onto its index entry so the parser reads one
+        // dictionary. `info` wins where the two overlap: it is the
+        // response that carries `imageSize`, and it repeats the location
+        // block anyway. Starting from the `inquire` entry rather than
+        // replacing it keeps anything the index reported and the detail
+        // happens to omit.
+        var merged = indexEntry ?? [:]
+        for (key, value) in detail {
+            merged[key] = value
+        }
+
+        guard let loaded = SurroundViewCaptureParser.capture(
+            from: merged,
+            vin: vehicle.vin,
+            shape: Self.surroundViewShape,
+            providerID: providerID,
+            apiName: apiName
+        ) else {
+            throw APIError.logError(
+                "Kia US 360 View capture \(providerID) carried no usable imagery",
+                apiName: apiName
+            )
+        }
+
+        surroundViewCache[providerID] = loaded
+        return loaded
     }
 
     // MARK: - Requests

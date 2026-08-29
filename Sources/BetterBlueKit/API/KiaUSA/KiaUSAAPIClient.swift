@@ -292,6 +292,13 @@ public final class KiaUSAAPIClient: APIClientBase, APIClientProtocol {
     /// ~280 KB of base64 behind its own request.
     var surroundViewCache: [String: SurroundViewCapture] = [:]
 
+    /// The last `lbs/svm/inquire` listing, keyed by `svmId`.
+    ///
+    /// Kept so a capture loaded on demand can still be merged onto the
+    /// metadata the index reported, exactly as an eager fetch does.
+    /// Metadata only — no imagery — so it costs a few small dictionaries.
+    var surroundViewIndex: [String: [String: Any]] = [:]
+
     public func sendCommand(for vehicle: Vehicle, command: VehicleCommand, authToken: AuthToken) async throws {
         let url = commandURL(for: command)
         let body = commandBody(for: command, vehicle: vehicle)
