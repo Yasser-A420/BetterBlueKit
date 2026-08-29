@@ -90,112 +90,17 @@ extension HyundaiUSAAPIClient {
             throw APIError.logError("Invalid Hyundai USA surround view response", apiName: apiName)
         }
 
-        let captures = details.compactMap { entry -> SurroundViewCapture? in
-            guard let detail = entry["svmDetail"] as? [String: Any] else { return nil }
-            return parseUSASurroundViewDetail(detail, for: vehicle)
-        }
-
-        // Newest first. Observed in that order already, but nothing
-        // documents the guarantee.
-        return captures.sorted {
-            ($0.capturedAt ?? .distantPast) > ($1.capturedAt ?? .distantPast)
-        }
-    }
-
-    private func parseUSASurroundViewDetail(
-        _ detail: [String: Any],
-        for vehicle: Vehicle
-    ) -> SurroundViewCapture? {
-        guard let encodedImage = detail["svmImage"] as? String,
-              let imageData = Data(base64Encoded: encodedImage, options: .ignoreUnknownCharacters) else {
-            BBLogger.debug(.api, "HyundaiUSA: skipping surround view entry without decodable image")
-            return nil
-        }
-
-        let frames = SurroundViewDecoder.extractJPEGFrames(from: imageData)
-        guard !frames.isEmpty else {
-            BBLogger.debug(.api, "HyundaiUSA: surround view entry contained no JPEG frames")
-            return nil
-        }
-
-        let imageSize = (detail["imageSize"] as? [Any])?.compactMap { extractNumber(from: $0) as Int? } ?? []
-        let gpsDetail = detail["gpsDetail"] as? [String: Any]
-        let heading: Int? = extractNumber(from: gpsDetail?["head"])
-
-        return SurroundViewCapture(
+        // Each element wraps its capture in `svmDetail`; Canada's array
+        // holds the captures directly. Everything inside matches the
+        // parser's defaults: a top-level `time` read ahead of
+        // `gpsDetail.time` (a capture taken without a GPS fix may drop
+        // `gpsDetail` entirely, and without that fallback every such
+        // capture would land on the same "unknown" id and lose its
+        // order), and coordinates nested under `gpsDetail.coord`.
+        return SurroundViewCaptureParser.captures(
+            from: details.compactMap { $0["svmDetail"] as? [String: Any] },
             vin: vehicle.vin,
-            // The real sample carries the stamp under `gpsDetail.time`, but
-            // read a top-level `time` first as the Canada client does: a
-            // capture taken without a GPS fix may drop `gpsDetail`, and
-            // without a fallback every such capture would land on the same
-            // "unknown" id and lose its order.
-            capturedAt: parseUSASurroundViewTimestamp(detail["time"] ?? gpsDetail?["time"]),
-            location: parseUSASurroundViewLocation(gpsDetail),
-            heading: heading,
-            doorOpen: parseUSASurroundViewDoors(detail["doorOpen"] as? [String: Any]),
-            trunkOpen: parseUSASurroundViewFlag(detail["trunkOpen"]),
-            sideMirrorOpen: parseUSASurroundViewFlag(detail["sidemirrorOpen"]),
-            frames: frames,
-            tiles: SurroundViewDecoder.tiles(imageSize: imageSize, frameCount: frames.count)
+            apiName: apiName
         )
-    }
-
-    /// `gpsDetail.time` is a bare `yyyyMMddHHmmss` stamp, e.g.
-    /// "20190913231516".
-    ///
-    /// Read as UTC to match the Canada client and because the app renders
-    /// the capture time in the user's own timezone regardless. This is the
-    /// one field not yet verified against a live USA capture — if a real
-    /// capture shows the vehicle's local time here, this needs the account
-    /// offset applied instead.
-    private func parseUSASurroundViewTimestamp(_ value: Any?) -> Date? {
-        guard let raw = value as? String, raw.count == 14 else { return nil }
-
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMddHHmmss"
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter.date(from: raw)
-    }
-
-    /// USA nests coordinates as `gpsDetail.coord.{lat,lon}`, unlike the flat
-    /// `coordLat`/`coordLon` pair the Canada SVM endpoints return.
-    private func parseUSASurroundViewLocation(_ gpsDetail: [String: Any]?) -> VehicleStatus.Location? {
-        guard let coord = gpsDetail?["coord"] as? [String: Any],
-              let latitude: Double = extractNumber(from: coord["lat"]),
-              let longitude: Double = extractNumber(from: coord["lon"]) else {
-            return nil
-        }
-
-        let location = VehicleStatus.Location(latitude: latitude, longitude: longitude)
-        return location.hasCoordinates ? location : nil
-    }
-
-    private func parseUSASurroundViewDoors(_ doors: [String: Any]?) -> VehicleStatus.DoorStatus? {
-        guard let doors else { return nil }
-
-        func isOpen(_ key: String) -> Bool {
-            parseUSASurroundViewFlag(doors[key]) ?? false
-        }
-
-        return VehicleStatus.DoorStatus(
-            frontLeft: isOpen("frontLeft"),
-            frontRight: isOpen("frontRight"),
-            backLeft: isOpen("backLeft"),
-            backRight: isOpen("backRight")
-        )
-    }
-
-    /// Reads an open/closed flag that may arrive as a JSON boolean or as
-    /// 0/1 (the sample response uses `0`/`1`). Nil only when the key is
-    /// absent, so "closed" and "not reported" stay distinguishable.
-    private func parseUSASurroundViewFlag(_ value: Any?) -> Bool? {
-        guard let value, !(value is NSNull) else { return nil }
-        if let bool = value as? Bool { return bool }
-        if let number: Int = extractNumber(from: value) { return number != 0 }
-        if let string = value as? String {
-            return ["true", "1", "y", "yes", "open"].contains(string.lowercased())
-        }
-        return nil
     }
 }

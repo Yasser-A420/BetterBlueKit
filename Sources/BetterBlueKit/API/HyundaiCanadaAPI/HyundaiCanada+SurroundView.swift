@@ -136,101 +136,16 @@ extension HyundaiCanadaAPIClient {
             throw APIError.logError("Invalid Canada surround view response", apiName: apiName)
         }
 
-        let captures = locations.compactMap { parseSurroundViewLocation($0, for: vehicle) }
-
-        // Newest first. The server has been observed returning them in
-        // that order already, but nothing documents that guarantee.
-        return captures.sorted {
-            ($0.capturedAt ?? .distantPast) > ($1.capturedAt ?? .distantPast)
-        }
-    }
-
-    private func parseSurroundViewLocation(
-        _ location: [String: Any],
-        for vehicle: Vehicle
-    ) -> SurroundViewCapture? {
-        guard let encodedImage = location["svmImage"] as? String,
-              let imageData = Data(base64Encoded: encodedImage, options: .ignoreUnknownCharacters) else {
-            BBLogger.debug(.api, "HyundaiCanada: skipping surround view entry without decodable image")
-            return nil
-        }
-
-        let frames = SurroundViewDecoder.extractJPEGFrames(from: imageData)
-        guard !frames.isEmpty else {
-            BBLogger.debug(.api, "HyundaiCanada: surround view entry contained no JPEG frames")
-            return nil
-        }
-
-        let imageSize = (location["imageSize"] as? [Any])?.compactMap { extractNumber(from: $0) as Int? } ?? []
-        let gpsDetail = location["gpsDetail"] as? [String: Any]
-
-        return SurroundViewCapture(
+        // Canada stamps the capture at the top level as `utcTime`; the
+        // `gpsDetail.time` fallback is the parser's default. Coordinates
+        // arrive flat as `coordLat`/`coordLon` rather than in the
+        // `coord: { lat, lon }` object the status endpoints use, which
+        // the default shape already covers.
+        return SurroundViewCaptureParser.captures(
+            from: locations,
             vin: vehicle.vin,
-            capturedAt: parseSurroundViewTimestamp(location["utcTime"] ?? gpsDetail?["time"]),
-            location: parseSurroundViewLocationCoordinates(gpsDetail),
-            heading: extractNumber(from: gpsDetail?["head"]),
-            doorOpen: parseSurroundViewDoors(location["doorOpen"] as? [String: Any]),
-            trunkOpen: parseSurroundViewFlag(location["trunkOpen"]),
-            sideMirrorOpen: parseSurroundViewFlag(location["sidemirrorOpen"]),
-            frames: frames,
-            tiles: SurroundViewDecoder.tiles(imageSize: imageSize, frameCount: frames.count)
-        )
-    }
-
-    /// `utcTime` is a bare `yyyyMMddHHmmss` stamp in UTC, e.g.
-    /// "20260826003935". The sibling `offset` field is the vehicle's
-    /// local timezone offset and is deliberately ignored — the app
-    /// renders the capture time in the user's own timezone.
-    private func parseSurroundViewTimestamp(_ value: Any?) -> Date? {
-        guard let raw = value as? String, raw.count == 14 else { return nil }
-
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMddHHmmss"
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter.date(from: raw)
-    }
-
-    /// SVM reports coordinates as flat `coordLat` / `coordLon` fields,
-    /// unlike the `coord: { lat, lon }` object the status endpoints use.
-    private func parseSurroundViewLocationCoordinates(_ gpsDetail: [String: Any]?) -> VehicleStatus.Location? {
-        guard let gpsDetail,
-              let latitude: Double = extractNumber(from: gpsDetail["coordLat"]),
-              let longitude: Double = extractNumber(from: gpsDetail["coordLon"]) else {
-            return nil
-        }
-
-        let location = VehicleStatus.Location(latitude: latitude, longitude: longitude)
-        return location.hasCoordinates ? location : nil
-    }
-
-    /// Reads an open/closed flag that may arrive as a JSON boolean or as
-    /// 0/1. This region mixes the two even within one payload — the same
-    /// `unit` field is `true` under `dte` and `1` under `distanceToEmpty`
-    /// (BetterBlue#98) — so never bet on a bare `as? Bool`.
-    /// Returns nil only when the key is absent entirely.
-    private func parseSurroundViewFlag(_ value: Any?) -> Bool? {
-        guard let value, !(value is NSNull) else { return nil }
-        if let bool = value as? Bool { return bool }
-        if let number: Int = extractNumber(from: value) { return number != 0 }
-        if let string = value as? String {
-            return ["true", "1", "y", "yes", "open"].contains(string.lowercased())
-        }
-        return nil
-    }
-
-    private func parseSurroundViewDoors(_ doors: [String: Any]?) -> VehicleStatus.DoorStatus? {
-        guard let doors else { return nil }
-
-        func isOpen(_ key: String) -> Bool {
-            parseSurroundViewFlag(doors[key]) ?? false
-        }
-
-        return VehicleStatus.DoorStatus(
-            frontLeft: isOpen("frontLeft"),
-            frontRight: isOpen("frontRight"),
-            backLeft: isOpen("backLeft"),
-            backRight: isOpen("backRight")
+            shape: .init(timestamp: [["utcTime"], ["gpsDetail", "time"]]),
+            apiName: apiName
         )
     }
 }
